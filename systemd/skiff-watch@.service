@@ -1,0 +1,9 @@
+[Unit]
+Description=skiff watch for one connection
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/skiff watch
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal

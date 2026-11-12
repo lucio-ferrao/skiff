@@ -1,0 +1,10 @@
+[Unit]
+Description=skiff session list, one skiff watch per connection
+
+[Socket]
+ListenStream=%t/skiff/watch.sock
+SocketMode=0600
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,12 @@
+{
+    "KPlugin": {
+        "Id": "skiff-seen",
+        "Name": "skiff: sessions seen",
+        "Description": "Marks the skiff sessions in a Ghostty window as seen when the window gains the focus.",
+        "License": "MIT",
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPackageStructure": "KWin/Script"
+}

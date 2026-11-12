@@ -1,0 +1,7 @@
+[Unit]
+Description=skiff: sessions in Ghostty window %i seen
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/skiff seen-window %i

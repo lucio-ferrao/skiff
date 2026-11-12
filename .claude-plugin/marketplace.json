@@ -1,0 +1,11 @@
+{
+  "name": "skiff",
+  "owner": { "name": "Lúcio Ferrão" },
+  "plugins": [
+    {
+      "name": "skiff",
+      "source": "./claude-plugin",
+      "description": "Reports Claude's state to skiff for the zmx session it runs in."
+    }
+  ]
+}

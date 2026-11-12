@@ -1,0 +1,5 @@
+{
+  "name": "skiff",
+  "version": "0.1.1",
+  "description": "Reports Claude's state (idle, working, asking, ready) to skiff for the zmx session it runs in."
+}

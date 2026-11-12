@@ -1,0 +1,21 @@
+{
+  "description": "Reports Claude's state to skiff; outside a zmx session skiff ignores it. An interrupted turn fires no Stop, so a prompt left idle clears working or asking.",
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "skiff state idle" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "skiff state working" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "skiff state working" }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "skiff state asking" }] }],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|elicitation_dialog",
+        "hooks": [{ "type": "command", "command": "skiff state asking" }]
+      },
+      {
+        "matcher": "idle_prompt",
+        "hooks": [{ "type": "command", "command": "skiff state idle --from working,asking" }]
+      }
+    ],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "skiff state ready" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "skiff state idle" }] }]
+  }
+}
