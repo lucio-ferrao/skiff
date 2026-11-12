@@ -3,7 +3,7 @@
 //! closing that window leaves the session running.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -11,10 +11,7 @@ use std::time::{Duration, Instant};
 use ansi_to_tui::IntoText;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
-};
-use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::buffer::Buffer;
@@ -31,6 +28,11 @@ use crate::watch;
 /// A card is at least this wide; the grid fits as many columns as it can.
 const CARD_MIN_WIDTH: u16 = 32;
 const CARD_HEIGHT: u16 = 10;
+/// Blank columns after a card, and blank rows under a row of cards.
+const CARD_GAP: u16 = 2;
+const ROW_GAP: u16 = 1;
+/// The strip a card is dropped on to leave its space, while no session is without one.
+const NO_SPACE_STRIP: u16 = 3;
 const PREVIEW_INTERVAL: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(100);
 
@@ -41,6 +43,19 @@ const READY: Color = Color::Rgb(0x94, 0xE2, 0xD5);
 const DIM: Color = Color::Rgb(0x6C, 0x70, 0x86);
 const TEXT: Color = Color::Rgb(0xCD, 0xD6, 0xF4);
 const SUBTEXT: Color = Color::Rgb(0xA6, 0xAD, 0xC8);
+// a card's title row: Mocha's surface 0, a shade lighter when selected, the text colour when lifted
+const TITLE: Color = Color::Rgb(0x31, 0x32, 0x44);
+const SELECTED: Color = Color::Rgb(0x58, 0x5B, 0x70);
+const LIFTED: Color = Color::Rgb(0x6C, 0x5A, 0x2E);
+const LIFTED_SCREEN: Color = Color::Rgb(0x2A, 0x26, 0x1C);
+// the shades spaces lie on, a darker one and a slightly lighter one in turn, so neighbours differ
+const SPACES: [Color; 2] = [Color::Rgb(0x1E, 0x1E, 0x2A), Color::Rgb(0x26, 0x26, 0x35)];
+/// The rows a space starts with, its name on the middle one.
+const SPACE_HEADING: u16 = 3;
+/// Columns kept blank on the left.
+const MARGIN: u16 = 2;
+// the title's colour: Mocha's blue
+const TITLE_COLOR: Color = Color::Rgb(0x89, 0xB4, 0xFA);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 enum Message {
@@ -62,6 +77,34 @@ enum Dialog {
         name: String,
         title: String,
     },
+    /// A space's name, to change it; [old] is the one it has.
+    Space {
+        old: String,
+        name: String,
+    },
+    /// The right button's menu over a card, where it was clicked.
+    Menu {
+        name: String,
+        at: (u16, u16),
+        item: usize,
+    },
+}
+
+const MENU: [&str; 2] = ["Rename", "Close"];
+
+/// Where a dragged card would land: beside another card (after it, or before), or at the end of
+/// a space, or of the sessions without one.
+enum Drop {
+    Card(String, bool),
+    Group(Option<String>),
+}
+
+/// Where each space and card goes, in list coordinates, before scrolling.
+struct Layout {
+    /// A space's frame, or the area of the sessions without a space.
+    groups: Vec<(Option<String>, Rect)>,
+    cards: Vec<(String, Rect)>,
+    height: u16,
 }
 
 struct App {
@@ -76,6 +119,20 @@ struct App {
     reveal: bool,
     /// Where each card was drawn last, for the mouse and for moving up and down.
     cards: Vec<(String, Rect)>,
+    /// Where each group was drawn last, for dropping a card past the others.
+    groups: Vec<(Option<String>, Rect)>,
+    /// Where the menu was drawn last.
+    menu: Rect,
+    /// The card under the left button, and where it went down.
+    press: Option<(String, (u16, u16))>,
+    /// The card being dragged, where the pointer held it, and where the pointer is.
+    dragging: Option<String>,
+    grab: (u16, u16),
+    pointer: (u16, u16),
+    /// Each space's rule with its name, where it was drawn last: dragged to move the space.
+    headers: Vec<(String, Rect)>,
+    press_space: Option<(String, (u16, u16))>,
+    dragging_space: Option<String>,
     notice: Option<String>,
     started: Instant,
     quit: bool,
@@ -118,6 +175,15 @@ pub fn ui() -> io::Result<()> {
         scroll: 0,
         reveal: true,
         cards: Vec::new(),
+        groups: Vec::new(),
+        menu: Rect::default(),
+        press: None,
+        dragging: None,
+        grab: (0, 0),
+        pointer: (0, 0),
+        headers: Vec::new(),
+        press_space: None,
+        dragging_space: None,
         notice: None,
         started: Instant::now(),
         quit: false,
@@ -125,30 +191,28 @@ pub fn ui() -> io::Result<()> {
     };
     loop {
         let mut terminal = ratatui::init();
-        // the kitty keyboard protocol tells ctrl+enter from enter
-        execute!(
-            io::stdout(),
-            EnableMouseCapture,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
+        execute!(io::stdout(), EnableMouseCapture)?;
         let result = run(&mut terminal, &mut app, &inbox, &wanted);
-        let _ = execute!(
-            io::stdout(),
-            PopKeyboardEnhancementFlags,
-            DisableMouseCapture
-        );
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
         result?;
         let Some(name) = app.attach.take() else {
             return Ok(());
         };
-        // the session takes this terminal; detaching from it (ctrl+\) comes back to the list
         session::mark_seen(&name)?;
-        Command::new("zmx")
-            .args(["attach", &name])
-            // inside a zmx session, attach would switch that session's clients instead
-            .env_remove("ZMX_SESSION")
-            .status()?;
+        // inside a zmx session the terminal moves to the chosen one (zmx's switch) and the list
+        // ends, so no session ever runs inside another
+        if std::env::var_os("ZMX_SESSION").is_some_and(|current| !current.is_empty()) {
+            Command::new("zmx").args(["attach", &name]).status()?;
+            return Ok(());
+        }
+        // the session takes this terminal; detaching from it (ctrl+\) comes back to the list
+        Command::new("zmx").args(["attach", &name]).status()?;
+        // pictures the session drew (kitty's graphics protocol) stay in the terminal over the text
+        // until deleted; its program sends them again when the session is entered again
+        let mut out = io::stdout();
+        out.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\")?;
+        out.flush()?;
     }
 }
 
@@ -176,12 +240,7 @@ fn run(
         if event::poll(TICK)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.key(key),
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => app.click(mouse.column, mouse.row),
-                    MouseEventKind::ScrollDown => app.scroll = app.scroll.saturating_add(3),
-                    MouseEventKind::ScrollUp => app.scroll = app.scroll.saturating_sub(3),
-                    _ => {}
-                },
+                Event::Mouse(mouse) => app.mouse(mouse),
                 _ => {}
             }
         }
@@ -211,20 +270,30 @@ impl App {
             .iter()
             .filter(|s| filter.is_empty() || s.shown_name().to_lowercase().contains(&filter))
             .collect::<Vec<_>>();
-        shown.sort_by_key(|s| {
-            (
-                s.space.is_some(),
-                s.space.clone(),
-                s.shown_name().to_lowercase(),
-            )
-        });
+        // grouped by space as skiff lists them, those without one first, each in its arranged order
+        shown.sort_by_key(|s| s.space.is_some());
         shown
     }
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let grid = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-        let status = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+        // a margin on the left, and above: a blank row, the title's rows, a blank row
+        let inner = Rect::new(
+            area.x + MARGIN,
+            area.y,
+            area.width.saturating_sub(MARGIN),
+            area.height,
+        );
+        let rows = TITLE_LETTERS.len() as u16;
+        let title = Rect::new(inner.x, inner.y + 1, inner.width, rows);
+        let grid = Rect::new(
+            inner.x,
+            inner.y + rows + 2,
+            inner.width,
+            inner.height.saturating_sub(rows + 3),
+        );
+        let status = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+        draw_title(frame, title);
         self.draw_grid(frame, grid);
         self.draw_status(frame, status);
         if self.dialog.is_some() {
@@ -232,45 +301,68 @@ impl App {
         }
     }
 
-    fn draw_grid(&mut self, frame: &mut Frame, area: Rect) {
-        let columns = (area.width / CARD_MIN_WIDTH).max(1);
-        let width = area.width / columns;
-        // Cards and headings in grid coordinates, before scrolling.
-        let mut headings = Vec::new();
-        let mut placed = Vec::new();
-        let (mut y, mut column) = (0u16, 0u16);
-        let mut group: Option<Option<String>> = None;
+    /// Each space on a shade of its own, starting with three rows, its name in the middle of the middle one; the sessions
+    /// without a space first, on the plain background.
+    fn layout(&self, width: u16) -> Layout {
         let visible = self
             .visible()
             .into_iter()
             .map(|s| (s.name.clone(), s.space.clone()))
             .collect::<Vec<_>>();
-        for (name, space) in visible {
-            if group.as_ref() != Some(&space) {
-                if column > 0 {
-                    y += CARD_HEIGHT;
-                    column = 0;
-                }
-                if let Some(heading) = &space {
-                    headings.push((y, heading.clone()));
-                    y += 1;
-                }
-                group = Some(space);
-            }
-            placed.push((name, Rect::new(column * width, y, width, CARD_HEIGHT)));
-            column += 1;
-            if column == columns {
-                column = 0;
-                y += CARD_HEIGHT;
-            }
+        let mut layout = Layout {
+            groups: Vec::new(),
+            cards: Vec::new(),
+            height: 0,
+        };
+        let mut y = 0u16;
+        // while a card is dragged and no session is without a space, a strip on top to drop it there
+        if self.dragging.is_some() && visible.iter().all(|(_, space)| space.is_some()) {
+            layout
+                .groups
+                .push((None, Rect::new(0, 0, width, NO_SPACE_STRIP)));
+            y = NO_SPACE_STRIP;
         }
-        let content_height = if column > 0 { y + CARD_HEIGHT } else { y };
-        if std::mem::take(&mut self.reveal) {
-            self.reveal_selected(&placed, area.height);
+        let mut index = 0;
+        while index < visible.len() {
+            let space = visible[index].1.clone();
+            let members = visible[index..]
+                .iter()
+                .take_while(|(_, s)| *s == space)
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            index += members.len();
+            let named = space.is_some();
+            let columns = (width / CARD_MIN_WIDTH).max(1);
+            let card_width = width / columns;
+            let top = y;
+            let first_row = y + if named { SPACE_HEADING } else { 0 };
+            let count = members.len() as u16;
+            for (position, name) in members.into_iter().enumerate() {
+                let position = position as u16;
+                let rect = Rect::new(
+                    (position % columns) * card_width,
+                    first_row + (position / columns) * (CARD_HEIGHT + ROW_GAP),
+                    card_width,
+                    CARD_HEIGHT,
+                );
+                layout.cards.push((name, rect));
+            }
+            y = first_row + count.div_ceil(columns) * (CARD_HEIGHT + ROW_GAP);
+            layout
+                .groups
+                .push((space, Rect::new(0, top, width, y - top)));
         }
-        self.scroll = self.scroll.min(content_height.saturating_sub(area.height));
+        layout.height = y;
+        layout
+    }
 
-        if placed.is_empty() {
+    fn draw_grid(&mut self, frame: &mut Frame, area: Rect) {
+        let layout = self.layout(area.width);
+        if std::mem::take(&mut self.reveal) {
+            self.reveal_selected(&layout.cards, area.height);
+        }
+        self.scroll = self.scroll.min(layout.height.saturating_sub(area.height));
+        if layout.cards.is_empty() {
             let text = if self.sessions.is_empty() {
                 "no sessions yet: n starts one"
             } else {
@@ -284,51 +376,162 @@ impl App {
                 Rect::new(area.x, area.y + area.height / 2, area.width, 1),
             );
         }
-        for (y, heading) in headings {
-            if let Some(row) = self.on_screen(area, Rect::new(0, y, area.width, 1)) {
-                let line = Line::from(Span::styled(
-                    format!(" {heading}"),
-                    Style::new().fg(SUBTEXT).bold(),
-                ));
-                frame.render_widget(line, row);
+        let target = self.drop_target();
+        let space_target = self.space_target();
+        self.groups.clear();
+        self.headers.clear();
+        let mut shade = 0;
+        for (space, rect) in layout.groups {
+            // spaces in turn, those without a space not counted
+            if space.is_some() {
+                shade += 1;
+            }
+            let lit = matches!(&target, Some(Drop::Group(g)) if *g == space);
+            let has_cards = layout
+                .cards
+                .iter()
+                .any(|(_, card)| card.y >= rect.y && card.bottom() <= rect.bottom());
+            if space.is_some()
+                && rect.y >= self.scroll
+                && rect.y + SPACE_HEADING <= self.scroll + area.height
+            {
+                let row = Rect::new(
+                    area.x,
+                    area.y + rect.y - self.scroll,
+                    area.width,
+                    SPACE_HEADING,
+                );
+                self.headers.push((space.clone().unwrap_or_default(), row));
+            }
+            let shown = blit(
+                frame,
+                area,
+                self.scroll,
+                rect,
+                Rect::default(),
+                |buffer, whole| {
+                    // a space on a shade of its own, its name in the middle of its first rows
+                    if let Some(name) = &space {
+                        buffer.set_style(whole, Style::new().bg(SPACES[shade % SPACES.len()]));
+                        Paragraph::new(
+                            Line::from(Span::styled(
+                                format!("{name} "),
+                                Style::new()
+                                    .fg(if lit { READY } else { SUBTEXT })
+                                    .add_modifier(Modifier::BOLD),
+                            ))
+                            .centered(),
+                        )
+                        .render(Rect::new(whole.x, whole.y + 1, whole.width, 1), buffer);
+                    } else if !has_cards {
+                        Paragraph::new(Line::from(Span::styled(
+                            "no space",
+                            Style::new().fg(if lit { READY } else { DIM }),
+                        )))
+                        .alignment(Alignment::Center)
+                        .render(
+                            Rect::new(whole.x, whole.y + whole.height / 2, whole.width, 1),
+                            buffer,
+                        );
+                    }
+                },
+            );
+            if let Some(shown) = shown {
+                self.groups.push((space, shown));
             }
         }
         self.cards.clear();
-        for (name, rect) in placed {
-            // a card half out of view is drawn cut, so the screen's height is all used
-            let top = rect.y.max(self.scroll);
-            let bottom = rect.bottom().min(self.scroll + area.height);
-            if top >= bottom {
-                continue;
-            }
+        for (name, rect) in layout.cards {
             let Some(session) = self.sessions.iter().find(|s| s.name == name) else {
                 continue;
             };
-            let whole = Rect::new(0, 0, rect.width, rect.height);
-            let mut card = Buffer::empty(whole);
-            self.draw_card(&mut card, whole, session);
-            let shown = Rect::new(
-                area.x + rect.x,
-                area.y + top - self.scroll,
-                rect.width,
-                bottom - top,
-            );
-            let screen = frame.buffer_mut();
-            for row in 0..shown.height {
-                for column in 0..shown.width {
-                    screen[(shown.x + column, shown.y + row)] =
-                        card[(column, top - rect.y + row)].clone();
+            let marker = match &target {
+                Some(Drop::Card(beside, after)) if *beside == name => Some(*after),
+                _ => None,
+            };
+            // a card half out of view is drawn cut, so the screen's height is all used; all of it but
+            // the blank columns after it is copied, on the terminal's background
+            let card = Rect::new(0, 0, rect.width.saturating_sub(CARD_GAP), rect.height);
+            let shown = blit(frame, area, self.scroll, rect, card, |buffer, whole| {
+                self.draw_card(buffer, whole, session, false);
+                // where a dragged card would go: a bar on this card's side
+                if let Some(after) = marker {
+                    let x = if after { whole.right() - 1 } else { whole.x };
+                    for y in whole.y..whole.bottom() {
+                        buffer[(x, y)].set_symbol("┃").set_fg(READY);
+                    }
                 }
+            });
+            if let Some(shown) = shown {
+                self.cards.push((name, shown));
             }
-            self.cards.push((name, shown));
         }
+        // where a dragged space would go: a line on the border above or below the space under it
+        if let Some((beside, after)) = &space_target
+            && let Some((_, rect)) = self.groups.iter().find(|(s, _)| s.as_ref() == Some(beside))
+        {
+            let y = if *after { rect.bottom() } else { rect.y };
+            if y < area.bottom() {
+                let line = "━".repeat(usize::from(area.width));
+                frame.render_widget(
+                    Span::styled(line, Style::new().fg(READY)),
+                    Rect::new(area.x, y, area.width, 1),
+                );
+            }
+        }
+        self.draw_dragged(frame, area);
     }
 
-    /// The card's place on screen, if it is entirely visible.
-    fn on_screen(&self, area: Rect, rect: Rect) -> Option<Rect> {
-        let top = rect.y.checked_sub(self.scroll)?;
-        (top + rect.height <= area.height)
-            .then(|| Rect::new(area.x + rect.x, area.y + top, rect.width, rect.height))
+    /// What is being dragged follows the pointer, over the list: a card where the pointer holds
+    /// it, or a space's rule on the pointer's row.
+    fn draw_dragged(&self, frame: &mut Frame, area: Rect) {
+        if let Some(name) = &self.dragging
+            && let Some(session) = self.sessions.iter().find(|s| &s.name == name)
+            && let Some((_, slot)) = self.cards.iter().find(|(n, _)| n == name)
+        {
+            let width = slot.width.min(area.width);
+            let height = CARD_HEIGHT.min(area.height);
+            let x = self
+                .pointer
+                .0
+                .saturating_sub(self.grab.0)
+                .clamp(area.x, area.right() - width);
+            let y = self
+                .pointer
+                .1
+                .saturating_sub(self.grab.1)
+                .clamp(area.y, area.bottom() - height);
+            let ghost = Rect::new(x, y, width, height);
+            let whole = Rect::new(0, 0, width, height);
+            let mut drawn = Buffer::empty(whole);
+            self.draw_card(&mut drawn, whole, session, true);
+            let screen = frame.buffer_mut();
+            for row in 0..height {
+                // the card only, not the blank columns after it
+                for column in 0..width.saturating_sub(CARD_GAP) {
+                    screen[(ghost.x + column, ghost.y + row)] = drawn[(column, row)].clone();
+                }
+            }
+        }
+        if let Some(name) = &self.dragging_space {
+            let row = Rect::new(
+                area.x,
+                self.pointer.1.clamp(area.y, area.bottom() - 1),
+                area.width,
+                1,
+            );
+            // the space's name row, centred, lifted
+            let heading = Paragraph::new(
+                Line::from(Span::styled(
+                    format!("{name} "),
+                    Style::new().fg(WORKING).add_modifier(Modifier::BOLD),
+                ))
+                .centered(),
+            )
+            .style(Style::new().bg(LIFTED_SCREEN));
+            frame.render_widget(Clear, row);
+            frame.render_widget(heading, row);
+        }
     }
 
     fn reveal_selected(&mut self, placed: &[(String, Rect)], height: u16) {
@@ -348,9 +551,13 @@ impl App {
         }
     }
 
-    fn draw_card(&self, buffer: &mut Buffer, area: Rect, session: &Session) {
-        let selected = self.selected.as_deref() == Some(session.name.as_str());
-        // the state on the right, marked as herdr and Termarchy do; idle has no mark
+    /// A card; [lifted], the copy that follows the pointer in a drag.
+    /// A card without a frame: a title row, on a shade of its own, with the name and right after it
+    /// the state as herdr and Termarchy mark it (idle has none); the screen below; and blank columns
+    /// on the right, between cards. [lifted]: the copy that follows the pointer in a drag.
+    fn draw_card(&self, buffer: &mut Buffer, area: Rect, session: &Session, lifted: bool) {
+        let selected =
+            self.selected.as_deref() == Some(session.name.as_str()) && self.dragging.is_none();
         let mark = match session.state.as_str() {
             "working" => {
                 let frame = (self.started.elapsed().as_millis() / 100) as usize % SPINNER.len();
@@ -360,36 +567,48 @@ impl App {
             "ready" => Some(("✓", READY)),
             _ => None,
         };
-        let title = Line::from(vec![
+        let shade = if lifted {
+            LIFTED
+        } else if selected {
+            SELECTED
+        } else {
+            TITLE
+        };
+        let mut title = vec![
             Span::raw(" "),
             Span::styled(
                 session.shown_name().to_owned(),
                 Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" "),
-        ]);
-        let mut block = Block::bordered()
-            .border_type(BorderType::Plain)
-            .border_style(Style::new().fg(if selected { TEXT } else { DIM }))
-            .title(title);
+        ];
         if let Some((mark, color)) = mark {
-            block = block.title_top(
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(mark, Style::new().fg(color)),
-                    Span::raw(" "),
-                ])
-                .right_aligned(),
-            );
+            title.push(Span::raw(" "));
+            title.push(Span::styled(mark, Style::new().fg(color)));
         }
-        let inner = block.inner(area);
-        block.render(area, buffer);
+        let width = area.width.saturating_sub(CARD_GAP);
+        Paragraph::new(Line::from(title))
+            .style(Style::new().bg(shade))
+            .render(Rect::new(area.x, area.y, width, 1), buffer);
         if let Some(text) = self.previews.get(&session.name) {
             // the bottom of the screen, where the prompt and the latest output are
+            let screen = Rect::new(area.x, area.y + 1, width, area.height.saturating_sub(1));
             let lines = text.lines.len();
-            let shown = usize::from(inner.height).min(lines);
+            let shown = usize::from(screen.height).min(lines);
             let tail = Text::from(text.lines[lines - shown..].to_vec());
-            Paragraph::new(tail).render(inner, buffer);
+            // on the terminal's own background, as the session shows; the lifted copy on a tint
+            if lifted {
+                buffer.set_style(screen, Style::new().bg(LIFTED_SCREEN));
+            }
+            Paragraph::new(tail).render(screen, buffer);
+            if lifted {
+                for y in screen.y..screen.bottom() {
+                    for x in screen.x..screen.right() {
+                        if buffer[(x, y)].bg == Color::Reset {
+                            buffer[(x, y)].set_bg(LIFTED_SCREEN);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -404,14 +623,45 @@ impl App {
             Line::from(Span::styled(format!(" {notice}"), Style::new().fg(ASKING)))
         } else {
             Line::from(Span::styled(
-                " enter open · ctrl+enter window · n new · r name & space · x end · / filter · q quit",
+                " enter open · w window · n new · r name & space · del end · / filter · esc quit",
                 Style::new().fg(DIM),
             ))
         };
         frame.render_widget(line, area);
     }
 
-    fn draw_dialog(&self, frame: &mut Frame, area: Rect) {
+    fn draw_dialog(&mut self, frame: &mut Frame, area: Rect) {
+        if let Some(Dialog::Menu { at, item, .. }) = &self.dialog {
+            let width = 12.min(area.width);
+            let height = (MENU.len() as u16 + 2).min(area.height);
+            let rect = Rect::new(
+                at.0.min(area.right().saturating_sub(width)),
+                at.1.min(area.bottom().saturating_sub(height)),
+                width,
+                height,
+            );
+            let block = Block::bordered()
+                .border_type(BorderType::Plain)
+                .border_style(Style::new().fg(TEXT));
+            let inner = block.inner(rect);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(block, rect);
+            let lines = MENU
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    let style = if index == *item {
+                        Style::new().fg(TEXT).add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::new().fg(TEXT)
+                    };
+                    Line::from(Span::styled(format!(" {label:<9}"), style))
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines), inner);
+            self.menu = rect;
+            return;
+        }
         let Some(dialog) = &self.dialog else { return };
         let field = |label: &str, value: &str, active: bool| {
             Line::from(vec![
@@ -421,10 +671,17 @@ impl App {
             ])
         };
         let (title, lines, hint) = match dialog {
+            // drawn above, where it was asked for
+            Dialog::Menu { .. } => return,
             Dialog::New { title } => (
                 " New session ",
                 vec![field("Name", title, true)],
                 "enter open · esc cancel",
+            ),
+            Dialog::Space { name, .. } => (
+                " Space ",
+                vec![field("Name", name, true)],
+                "enter save · esc cancel",
             ),
             Dialog::Edit {
                 title,
@@ -497,6 +754,8 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
+            // Esc leaves, after clearing a filter first
+            KeyCode::Esc if self.filter.is_empty() => self.quit = true,
             KeyCode::Esc => {
                 self.filter.clear();
                 self.keep_selection_visible();
@@ -504,9 +763,12 @@ impl App {
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Left | KeyCode::Char('h') => self.step(-1),
             KeyCode::Right | KeyCode::Char('l') => self.step(1),
+            // Tab goes round the list, from the last back to the first
+            KeyCode::Tab => self.cycle(1),
+            KeyCode::BackTab => self.cycle(-1),
             KeyCode::Up | KeyCode::Char('k') => self.vertical(false),
             KeyCode::Down | KeyCode::Char('j') => self.vertical(true),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('w') => {
                 if let Some(name) = self.selected.clone() {
                     self.open_window(&name);
                 }
@@ -527,7 +789,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('x') => {
+            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
                 if let Some(session) = self.selected_session() {
                     self.dialog = Some(Dialog::End {
                         name: session.name.clone(),
@@ -548,6 +810,19 @@ impl App {
             return;
         }
         match dialog {
+            Dialog::Menu { name, item, .. } => match key.code {
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                    *item = item.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                    *item = (*item + 1).min(MENU.len() - 1)
+                }
+                KeyCode::Enter => {
+                    let (name, item) = (name.clone(), *item);
+                    self.choose(&name, item);
+                }
+                _ => {}
+            },
             Dialog::End { name, .. } => match key.code {
                 KeyCode::Char('y') => {
                     let name = name.clone();
@@ -555,6 +830,21 @@ impl App {
                     self.report(session::kill(&name));
                 }
                 KeyCode::Char('n') => self.dialog = None,
+                _ => {}
+            },
+            Dialog::Space { old, name } => match key.code {
+                KeyCode::Enter if !name.trim().is_empty() => {
+                    let (old, name) = (old.clone(), name.trim().to_owned());
+                    self.dialog = None;
+                    if name != old {
+                        let result = session::rename_space(&old, &name);
+                        self.report(result);
+                    }
+                }
+                KeyCode::Backspace => {
+                    name.pop();
+                }
+                KeyCode::Char(c) => name.push(c),
                 _ => {}
             },
             Dialog::New { title } => match key.code {
@@ -606,19 +896,222 @@ impl App {
         }
     }
 
-    fn click(&mut self, column: u16, row: u16) {
-        if self.dialog.is_some() {
-            return;
+    /// The left button enters a session, or drags its card to another place or space; the middle
+    /// one opens it in a window, as it opens a link in a new tab; the right one opens its menu.
+    fn mouse(&mut self, event: MouseEvent) {
+        let at = (event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(Dialog::Menu { name, .. }) = &self.dialog {
+                    let name = name.clone();
+                    let inside = self.menu.contains(at.into());
+                    self.dialog = None;
+                    // the border rows are no item
+                    if inside && at.1 > self.menu.y && at.1 < self.menu.bottom() - 1 {
+                        self.choose(&name, usize::from(at.1 - self.menu.y - 1));
+                    }
+                    return;
+                }
+                if self.dialog.is_none() {
+                    self.press = self.card_at(at).map(|name| (name, at));
+                    self.press_space = self
+                        .headers
+                        .iter()
+                        .find(|(_, row)| row.contains(at.into()))
+                        .map(|(name, _)| (name.clone(), at));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((name, from)) = &self.press
+                    && self.dragging.is_none()
+                    && *from != at
+                {
+                    // the copy that follows the pointer keeps the spot it was held by
+                    if let Some((_, rect)) = self.cards.iter().find(|(n, _)| n == name) {
+                        self.grab = (from.0 - rect.x, from.1 - rect.y);
+                    }
+                    self.selected = Some(name.clone());
+                    self.dragging = Some(name.clone());
+                }
+                if let Some((name, from)) = &self.press_space
+                    && self.dragging_space.is_none()
+                    && *from != at
+                {
+                    self.dragging_space = Some(name.clone());
+                }
+                self.pointer = at;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.pointer = at;
+                if self.dragging_space.is_some() {
+                    self.drop_space();
+                } else if self.dragging.is_some() {
+                    self.drop_dragged();
+                } else if let Some((name, _)) = self.press.take() {
+                    self.selected = Some(name.clone());
+                    self.attach = Some(name);
+                } else if let Some((space, _)) = self.press_space.take() {
+                    // a click on a space's name renames it
+                    self.dialog = Some(Dialog::Space {
+                        name: space.clone(),
+                        old: space,
+                    });
+                }
+                self.press = None;
+                self.press_space = None;
+            }
+            MouseEventKind::Down(MouseButton::Middle) if self.dialog.is_none() => {
+                if let Some(name) = self.card_at(at) {
+                    self.selected = Some(name.clone());
+                    self.open_window(&name);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.dialog.is_none() => {
+                if let Some(name) = self.card_at(at) {
+                    self.selected = Some(name.clone());
+                    self.dialog = Some(Dialog::Menu { name, at, item: 0 });
+                }
+            }
+            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_add(3),
+            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
+            _ => {}
         }
-        let hit = self
+    }
+
+    fn card_at(&self, at: (u16, u16)) -> Option<String> {
+        self.cards
+            .iter()
+            .find(|(_, rect)| rect.contains(at.into()))
+            .map(|(name, _)| name.clone())
+    }
+
+    /// A menu item for session [name]: its name and space, or ending it.
+    fn choose(&mut self, name: &str, item: usize) {
+        self.dialog = None;
+        let Some(session) = self.sessions.iter().find(|s| s.name == name) else {
+            return;
+        };
+        self.dialog = Some(match item {
+            0 => Dialog::Edit {
+                name: session.name.clone(),
+                title: session.shown_name().to_owned(),
+                space: session.space.clone().unwrap_or_default(),
+                field: 0,
+            },
+            _ => Dialog::End {
+                name: session.name.clone(),
+                title: session.shown_name().to_owned(),
+            },
+        });
+    }
+
+    /// Where a dragged space would land: above the space under the pointer, or below it when the
+    /// pointer is in its lower half; over the sessions without a space, above the first space.
+    fn space_target(&self) -> Option<(String, bool)> {
+        let dragged = self.dragging_space.as_ref()?;
+        let (x, y) = self.pointer;
+        let under = self
+            .groups
+            .iter()
+            .find(|(_, rect)| rect.contains((x, y).into()));
+        match under {
+            Some((Some(space), rect)) if space != dragged => {
+                Some((space.clone(), y >= rect.y + rect.height / 2))
+            }
+            Some((None, _)) => self
+                .groups
+                .iter()
+                .find_map(|(space, _)| space.clone().filter(|s| s != dragged))
+                .map(|first| (first, false)),
+            _ => None,
+        }
+    }
+
+    fn drop_space(&mut self) {
+        let target = self.space_target();
+        let Some(dragged) = self.dragging_space.take() else {
+            return;
+        };
+        let Some((beside, after)) = target else {
+            return;
+        };
+        let mut order = Vec::<String>::new();
+        for space in self.sessions.iter().filter_map(|s| s.space.clone()) {
+            if space != dragged && !order.contains(&space) {
+                order.push(space);
+            }
+        }
+        let index = order
+            .iter()
+            .position(|s| *s == beside)
+            .unwrap_or(order.len());
+        order.insert(index + usize::from(after), dragged);
+        let result = session::arrange_spaces(order);
+        self.report(result);
+    }
+
+    /// Where the dragged card would land, by the pointer; over itself, nowhere.
+    fn drop_target(&self) -> Option<Drop> {
+        let dragged = self.dragging.as_ref()?;
+        let at = self.pointer.into();
+        let (name, rect) = self
             .cards
             .iter()
-            .find(|(_, rect)| rect.contains((column, row).into()))
-            .map(|(name, _)| name.clone());
-        if let Some(name) = hit {
-            self.selected = Some(name.clone());
-            self.attach = Some(name);
+            .find(|(_, rect)| rect.contains(at))?
+            .clone();
+        if &name == dragged {
+            return None;
         }
+        Some(Drop::Card(name, self.pointer.0 >= rect.x + rect.width / 2))
+    }
+
+    /// Puts the dragged card where it was let go: beside a card, in that card's space, or at the
+    /// end of the space under the pointer.
+    fn drop_dragged(&mut self) {
+        let target = self.drop_target().or_else(|| {
+            let at = self.pointer.into();
+            self.groups
+                .iter()
+                .find(|(_, rect)| rect.contains(at))
+                .map(|(space, _)| Drop::Group(space.clone()))
+        });
+        let Some(dragged) = self.dragging.take() else {
+            return;
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let space_of = |name: &str| {
+            self.sessions
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.space.clone())
+        };
+        let mut order = self
+            .sessions
+            .iter()
+            .map(|s| s.name.clone())
+            .filter(|name| *name != dragged)
+            .collect::<Vec<_>>();
+        let (space, index) = match target {
+            Drop::Card(beside, after) => {
+                let index = order
+                    .iter()
+                    .position(|n| *n == beside)
+                    .unwrap_or(order.len());
+                (space_of(&beside), index + usize::from(after))
+            }
+            Drop::Group(space) => {
+                let end = order
+                    .iter()
+                    .rposition(|n| space_of(n) == space)
+                    .map_or(order.len(), |last| last + 1);
+                (space, end)
+            }
+        };
+        order.insert(index, dragged.clone());
+        let result = session::arrange(&dragged, space.as_deref(), order);
+        self.report(result);
     }
 
     fn selected_session(&self) -> Option<&Session> {
@@ -636,6 +1129,20 @@ impl App {
         {
             self.selected = visible.first().map(|s| s.name.clone());
         }
+    }
+
+    fn cycle(&mut self, by: isize) {
+        self.reveal = true;
+        let names = self
+            .visible()
+            .into_iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>();
+        let Some(at) = names.iter().position(|n| Some(n) == self.selected.as_ref()) else {
+            return;
+        };
+        let next = (at as isize + by).rem_euclid(names.len() as isize) as usize;
+        self.selected = Some(names[next].clone());
     }
 
     fn step(&mut self, by: isize) {
@@ -867,6 +1374,57 @@ fn keep_text_and_colors(dump: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// "skiff" in wassup's big letters (its bigtext.rs): box-drawing strokes, lowercase and rounded.
+const TITLE_LETTERS: [&str; 3] = ["    ╷   ·  ╭╴  ╭╴", "╭─╴ ├┬╴ ╷ ╶┼╴ ╶┼╴", "╶─╯ ╵╰╴ ╵  ╵   ╵"];
+
+/// The title in big letters, as wassup writes a chat's name over it, in a colour of its own.
+fn draw_title(frame: &mut Frame, area: Rect) {
+    let lines = TITLE_LETTERS
+        .iter()
+        .map(|row| Line::from(Span::styled(*row, Style::new().fg(TITLE_COLOR))))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+}
+
+/// Draws [rect], in list coordinates, through [draw] into a buffer of its size, and copies the
+/// part in view onto the screen; returns where it went. Cells left untouched are not copied, so
+/// what is under them shows, except within [opaque] (in the drawing's coordinates), copied whole:
+/// a card's screen keeps the terminal's background over its space's.
+fn blit(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: u16,
+    rect: Rect,
+    opaque: Rect,
+    draw: impl FnOnce(&mut Buffer, Rect),
+) -> Option<Rect> {
+    let top = rect.y.max(scroll);
+    let bottom = rect.bottom().min(scroll + area.height);
+    if top >= bottom {
+        return None;
+    }
+    let whole = Rect::new(0, 0, rect.width, rect.height);
+    let mut drawn = Buffer::empty(whole);
+    draw(&mut drawn, whole);
+    let shown = Rect::new(
+        area.x + rect.x,
+        area.y + top - scroll,
+        rect.width,
+        bottom - top,
+    );
+    let screen = frame.buffer_mut();
+    for row in 0..shown.height {
+        for column in 0..shown.width {
+            let at = (column, top - rect.y + row);
+            let cell = &drawn[at];
+            if cell != &ratatui::buffer::Cell::EMPTY || opaque.contains(at.into()) {
+                screen[(shown.x + column, shown.y + row)] = cell.clone();
+            }
+        }
+    }
+    Some(shown)
 }
 
 #[cfg(test)]

@@ -16,6 +16,13 @@ pub struct Spaces {
     /// rename one, and the agent's hooks find theirs by it.
     #[serde(default)]
     pub titles: BTreeMap<String, String>,
+    /// Sessions in the order they were arranged in, within their spaces; those not in it follow by
+    /// name.
+    #[serde(default)]
+    pub order: Vec<String>,
+    /// Spaces in the order they were arranged in; those not in it follow by name.
+    #[serde(default)]
+    pub space_order: Vec<String>,
 }
 
 pub fn config_dir() -> PathBuf {

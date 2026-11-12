@@ -39,7 +39,32 @@ pub fn sessions() -> std::io::Result<Vec<Session>> {
             name: session.name,
         })
         .collect::<Vec<_>>();
-    sessions.sort_by(|a, b| (&a.space, &a.name).cmp(&(&b.space, &b.name)));
+    let position = |name: &str| {
+        spaces
+            .order
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or(usize::MAX)
+    };
+    let space_position = |space: &Option<String>| {
+        space.as_ref().map_or(0, |space| {
+            spaces
+                .space_order
+                .iter()
+                .position(|s| s == space)
+                .unwrap_or(usize::MAX)
+        })
+    };
+    // those without a space first, then each space in its arranged order
+    sessions.sort_by_cached_key(|s| {
+        (
+            s.space.is_some(),
+            space_position(&s.space),
+            s.space.clone(),
+            position(&s.name),
+            s.name.clone(),
+        )
+    });
     Ok(sessions)
 }
 
@@ -139,6 +164,41 @@ fn claude_runs_under(shell: u32) -> bool {
         })
 }
 
+/// Puts [name] in [space] (None: no space) and sets the order of the sessions to [order], as a
+/// drag in the list leaves them.
+pub fn arrange(name: &str, space: Option<&str>, order: Vec<String>) -> std::io::Result<()> {
+    let mut spaces = crate::store::Spaces::load();
+    match space {
+        Some(space) => spaces.sessions.insert(name.to_owned(), space.to_owned()),
+        None => spaces.sessions.remove(name),
+    };
+    spaces.order = order;
+    spaces.save()
+}
+
+/// Gives space [old] the name [new]: its sessions, and its place among the spaces, go with it.
+pub fn rename_space(old: &str, new: &str) -> std::io::Result<()> {
+    let mut spaces = crate::store::Spaces::load();
+    for space in spaces.sessions.values_mut() {
+        if space == old {
+            *space = new.to_owned();
+        }
+    }
+    for space in &mut spaces.space_order {
+        if space == old {
+            *space = new.to_owned();
+        }
+    }
+    spaces.save()
+}
+
+/// Sets the order of the spaces, as a drag in the list leaves them.
+pub fn arrange_spaces(order: Vec<String>) -> std::io::Result<()> {
+    let mut spaces = crate::store::Spaces::load();
+    spaces.space_order = order;
+    spaces.save()
+}
+
 pub fn move_to(name: &str, space: &str) -> std::io::Result<()> {
     let mut spaces = crate::store::Spaces::load();
     if space == "-" {
@@ -155,7 +215,10 @@ pub fn kill(name: &str) -> std::io::Result<()> {
     }
     let mut spaces = crate::store::Spaces::load();
     let had_space = spaces.sessions.remove(name).is_some();
-    if spaces.titles.remove(name).is_some() || had_space {
+    let had_title = spaces.titles.remove(name).is_some();
+    let placed = spaces.order.len();
+    spaces.order.retain(|n| n != name);
+    if had_space || had_title || spaces.order.len() != placed {
         spaces.save()?;
     }
     Ok(())

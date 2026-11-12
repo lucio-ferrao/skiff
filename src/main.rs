@@ -108,16 +108,25 @@ fn new(name: &str, rest: &[&str]) -> std::io::Result<()> {
     Err(zmx::attach(name, &command))
 }
 
-/// Opens a session by its name, or by the title it was given.
+/// Opens a session by its zmx name or, failing that, by the title a live session was given; a
+/// name neither matches starts a session. A title left behind by a session that ended never
+/// counts, or it would bring that session back.
 fn open(name: &str) -> std::io::Result<()> {
-    let spaces = store::Spaces::load();
-    let name = spaces
-        .titles
-        .iter()
-        .find(|(_, title)| *title == name)
-        .map_or(name, |(session, _)| session.as_str());
-    session::mark_seen(name)?;
-    Err(zmx::attach(name, &[]))
+    let live = zmx::list()?
+        .into_iter()
+        .map(|session| session.name)
+        .collect::<Vec<_>>();
+    let titles = store::Spaces::load().titles;
+    let name = if live.iter().any(|session| session == name) {
+        name.to_owned()
+    } else {
+        titles
+            .into_iter()
+            .find(|(session, title)| title == name && live.contains(session))
+            .map_or_else(|| name.to_owned(), |(session, _)| session)
+    };
+    session::mark_seen(&name)?;
+    Err(zmx::attach(&name, &[]))
 }
 
 /// Called by the agent's hooks. Outside a zmx session there is nothing to record. With `from`,
