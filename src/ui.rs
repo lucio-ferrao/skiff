@@ -63,8 +63,10 @@ enum Message {
 }
 
 enum Dialog {
+    /// A new session, in [space] when it was asked for over a space.
     New {
         title: String,
+        space: Option<String>,
     },
     Edit {
         name: String,
@@ -135,6 +137,9 @@ struct App {
     /// Each space's rule with its name, where it was drawn last: dragged to move the space.
     headers: Vec<(String, Rect)>,
     press_space: Option<(String, (u16, u16))>,
+    /// The group whose background the left button went down on (None: the sessions without a
+    /// space).
+    press_group: Option<Option<String>>,
     dragging_space: Option<String>,
     notice: Option<String>,
     started: Instant,
@@ -188,6 +193,7 @@ pub fn ui() -> io::Result<()> {
         pointer: (0, 0),
         headers: Vec::new(),
         press_space: None,
+        press_group: None,
         dragging_space: None,
         notice: None,
         started: Instant::now(),
@@ -687,13 +693,16 @@ impl App {
         let (title, lines, hint) = match dialog {
             // drawn above, where it was asked for
             Dialog::Menu { .. } => return,
-            Dialog::New { title } => (
-                " New session ",
+            Dialog::New { title, space } => (
+                match space {
+                    Some(space) => format!(" New session in {space} "),
+                    None => " New session ".to_owned(),
+                },
                 vec![field("Name", title, true)],
                 "enter open · esc cancel",
             ),
             Dialog::Space { name, .. } => (
-                " Space ",
+                " Space ".to_owned(),
                 vec![field("Name", name, true)],
                 "enter save · esc cancel",
             ),
@@ -703,7 +712,7 @@ impl App {
                 field: active,
                 ..
             } => (
-                " Session ",
+                " Session ".to_owned(),
                 vec![
                     field("Name", title, *active == 0),
                     field("Space", space, *active == 1),
@@ -711,7 +720,7 @@ impl App {
                 "tab next · enter save · esc cancel",
             ),
             Dialog::End { title, .. } => (
-                " End session ",
+                " End session ".to_owned(),
                 vec![Line::from(Span::styled(
                     format!("End {title}? Whatever runs in it stops."),
                     Style::new().fg(TEXT),
@@ -791,6 +800,7 @@ impl App {
             KeyCode::Char('n') => {
                 self.dialog = Some(Dialog::New {
                     title: String::new(),
+                    space: None,
                 })
             }
             KeyCode::Char('r') => {
@@ -861,11 +871,11 @@ impl App {
                 KeyCode::Char(c) => name.push(c),
                 _ => {}
             },
-            Dialog::New { title } => match key.code {
+            Dialog::New { title, space } => match key.code {
                 KeyCode::Enter if !title.trim().is_empty() => {
-                    let title = title.trim().to_owned();
+                    let (title, space) = (title.trim().to_owned(), space.clone());
                     self.dialog = None;
-                    self.create(&title);
+                    self.create(&title, space.as_deref());
                 }
                 KeyCode::Backspace => {
                     title.pop();
@@ -933,6 +943,15 @@ impl App {
                         .iter()
                         .find(|(_, row)| row.contains(at.into()))
                         .map(|(name, _)| (name.clone(), at));
+                    // a space's background, past its heading and its cards
+                    self.press_group = if self.press.is_none() && self.press_space.is_none() {
+                        self.groups
+                            .iter()
+                            .find(|(_, rect)| rect.contains(at.into()))
+                            .map(|(space, _)| space.clone())
+                    } else {
+                        None
+                    };
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -964,6 +983,12 @@ impl App {
                 } else if let Some((name, _)) = self.press.take() {
                     self.selected = Some(name.clone());
                     self.attach = Some(name);
+                } else if let Some(space) = self.press_group.take() {
+                    // a click on a space's background starts a session in it
+                    self.dialog = Some(Dialog::New {
+                        title: String::new(),
+                        space,
+                    });
                 } else if let Some((space, _)) = self.press_space.take() {
                     // a click on a space's name folds it, or opens it
                     match session::toggle_collapsed(&space) {
@@ -976,6 +1001,7 @@ impl App {
                 }
                 self.press = None;
                 self.press_space = None;
+                self.press_group = None;
             }
             MouseEventKind::Down(MouseButton::Middle) if self.dialog.is_none() => {
                 if let Some(name) = self.card_at(at) {
@@ -1283,7 +1309,7 @@ impl App {
     }
 
     /// A new session called [title]: its zmx name comes from the title, as in Termarchy.
-    fn create(&mut self, title: &str) {
+    fn create(&mut self, title: &str, space: Option<&str>) {
         let taken = self
             .sessions
             .iter()
@@ -1292,6 +1318,12 @@ impl App {
         let name = session::session_id(title, &taken);
         if title != name
             && let Err(err) = session::rename(&name, title)
+        {
+            self.notice = Some(err.to_string());
+            return;
+        }
+        if let Some(space) = space
+            && let Err(err) = session::move_to(&name, space)
         {
             self.notice = Some(err.to_string());
             return;
