@@ -13,11 +13,15 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEventKind,
 };
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::desktop;
@@ -25,7 +29,7 @@ use crate::session::{self, Session};
 use crate::watch;
 
 /// A card is at least this wide; the grid fits as many columns as it can.
-const CARD_MIN_WIDTH: u16 = 44;
+const CARD_MIN_WIDTH: u16 = 32;
 const CARD_HEIGHT: u16 = 10;
 const PREVIEW_INTERVAL: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(100);
@@ -68,11 +72,15 @@ struct App {
     filtering: bool,
     dialog: Option<Dialog>,
     scroll: u16,
+    /// Bring the selected card into view on the next draw; set when the keyboard moves the selection.
+    reveal: bool,
     /// Where each card was drawn last, for the mouse and for moving up and down.
     cards: Vec<(String, Rect)>,
     notice: Option<String>,
     started: Instant,
     quit: bool,
+    /// The session to enter here, leaving the list until it is detached.
+    attach: Option<String>,
 }
 
 pub fn ui() -> io::Result<()> {
@@ -100,19 +108,6 @@ pub fn ui() -> io::Result<()> {
         }
     });
 
-    let mut terminal = ratatui::init();
-    execute!(io::stdout(), EnableMouseCapture)?;
-    let result = run(&mut terminal, &inbox, &wanted);
-    let _ = execute!(io::stdout(), DisableMouseCapture);
-    ratatui::restore();
-    result
-}
-
-fn run(
-    terminal: &mut DefaultTerminal,
-    inbox: &mpsc::Receiver<Message>,
-    wanted: &mpsc::Sender<Vec<String>>,
-) -> io::Result<()> {
     let mut app = App {
         sessions: Vec::new(),
         previews: HashMap::new(),
@@ -121,13 +116,50 @@ fn run(
         filtering: false,
         dialog: None,
         scroll: 0,
+        reveal: true,
         cards: Vec::new(),
         notice: None,
         started: Instant::now(),
         quit: false,
+        attach: None,
     };
+    loop {
+        let mut terminal = ratatui::init();
+        // the kitty keyboard protocol tells ctrl+enter from enter
+        execute!(
+            io::stdout(),
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        let result = run(&mut terminal, &mut app, &inbox, &wanted);
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture
+        );
+        ratatui::restore();
+        result?;
+        let Some(name) = app.attach.take() else {
+            return Ok(());
+        };
+        // the session takes this terminal; detaching from it (ctrl+\) comes back to the list
+        session::mark_seen(&name)?;
+        Command::new("zmx")
+            .args(["attach", &name])
+            // inside a zmx session, attach would switch that session's clients instead
+            .env_remove("ZMX_SESSION")
+            .status()?;
+    }
+}
+
+fn run(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    inbox: &mpsc::Receiver<Message>,
+    wanted: &mpsc::Sender<Vec<String>>,
+) -> io::Result<()> {
     let mut last_preview = Instant::now() - PREVIEW_INTERVAL;
-    while !app.quit {
+    while !app.quit && app.attach.is_none() {
         while let Ok(message) = inbox.try_recv() {
             match message {
                 Message::Sessions(sessions) => app.set_sessions(sessions),
@@ -233,7 +265,9 @@ impl App {
             }
         }
         let content_height = if column > 0 { y + CARD_HEIGHT } else { y };
-        self.reveal_selected(&placed, area.height);
+        if std::mem::take(&mut self.reveal) {
+            self.reveal_selected(&placed, area.height);
+        }
         self.scroll = self.scroll.min(content_height.saturating_sub(area.height));
 
         if placed.is_empty() {
@@ -261,13 +295,32 @@ impl App {
         }
         self.cards.clear();
         for (name, rect) in placed {
-            let Some(rect) = self.on_screen(area, rect) else {
+            // a card half out of view is drawn cut, so the screen's height is all used
+            let top = rect.y.max(self.scroll);
+            let bottom = rect.bottom().min(self.scroll + area.height);
+            if top >= bottom {
+                continue;
+            }
+            let Some(session) = self.sessions.iter().find(|s| s.name == name) else {
                 continue;
             };
-            if let Some(session) = self.sessions.iter().find(|s| s.name == name) {
-                self.draw_card(frame, rect, session);
+            let whole = Rect::new(0, 0, rect.width, rect.height);
+            let mut card = Buffer::empty(whole);
+            self.draw_card(&mut card, whole, session);
+            let shown = Rect::new(
+                area.x + rect.x,
+                area.y + top - self.scroll,
+                rect.width,
+                bottom - top,
+            );
+            let screen = frame.buffer_mut();
+            for row in 0..shown.height {
+                for column in 0..shown.width {
+                    screen[(shown.x + column, shown.y + row)] =
+                        card[(column, top - rect.y + row)].clone();
+                }
             }
-            self.cards.push((name, rect));
+            self.cards.push((name, shown));
         }
     }
 
@@ -295,7 +348,7 @@ impl App {
         }
     }
 
-    fn draw_card(&self, frame: &mut Frame, area: Rect, session: &Session) {
+    fn draw_card(&self, buffer: &mut Buffer, area: Rect, session: &Session) {
         let selected = self.selected.as_deref() == Some(session.name.as_str());
         // the state on the right, marked as herdr and Termarchy do; idle has no mark
         let mark = match session.state.as_str() {
@@ -330,13 +383,13 @@ impl App {
             );
         }
         let inner = block.inner(area);
-        frame.render_widget(block, area);
+        block.render(area, buffer);
         if let Some(text) = self.previews.get(&session.name) {
             // the bottom of the screen, where the prompt and the latest output are
             let lines = text.lines.len();
             let shown = usize::from(inner.height).min(lines);
             let tail = Text::from(text.lines[lines - shown..].to_vec());
-            frame.render_widget(Paragraph::new(tail), inner);
+            Paragraph::new(tail).render(inner, buffer);
         }
     }
 
@@ -351,7 +404,7 @@ impl App {
             Line::from(Span::styled(format!(" {notice}"), Style::new().fg(ASKING)))
         } else {
             Line::from(Span::styled(
-                " enter open · n new · r name & space · x end · / filter · q quit",
+                " enter open · ctrl+enter window · n new · r name & space · x end · / filter · q quit",
                 Style::new().fg(DIM),
             ))
         };
@@ -453,11 +506,12 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.step(1),
             KeyCode::Up | KeyCode::Char('k') => self.vertical(false),
             KeyCode::Down | KeyCode::Char('j') => self.vertical(true),
-            KeyCode::Enter => {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(name) = self.selected.clone() {
-                    self.open(&name);
+                    self.open_window(&name);
                 }
             }
+            KeyCode::Enter => self.attach = self.selected.clone(),
             KeyCode::Char('n') => {
                 self.dialog = Some(Dialog::New {
                     title: String::new(),
@@ -563,7 +617,7 @@ impl App {
             .map(|(name, _)| name.clone());
         if let Some(name) = hit {
             self.selected = Some(name.clone());
-            self.open(&name);
+            self.attach = Some(name);
         }
     }
 
@@ -574,6 +628,7 @@ impl App {
     }
 
     fn keep_selection_visible(&mut self) {
+        self.reveal = true;
         let visible = self.visible();
         if !visible
             .iter()
@@ -584,6 +639,7 @@ impl App {
     }
 
     fn step(&mut self, by: isize) {
+        self.reveal = true;
         let names = self
             .visible()
             .into_iter()
@@ -598,6 +654,7 @@ impl App {
 
     /// Moves to the card above or below, the nearest across; off screen, along the list instead.
     fn vertical(&mut self, down: bool) {
+        self.reveal = true;
         let Some(from) = self
             .cards
             .iter()
@@ -632,7 +689,7 @@ impl App {
 
     /// Brings the session's window to the front, or opens it in a Ghostty window of its own, which
     /// outlives this list.
-    fn open(&mut self, name: &str) {
+    fn open_window(&mut self, name: &str) {
         if let Some(window) = desktop::window_of(name) {
             match desktop::focus(window) {
                 Ok(true) => {
@@ -677,7 +734,7 @@ impl App {
             return;
         }
         self.selected = Some(name.clone());
-        self.open(&name);
+        self.attach = Some(name);
     }
 
     fn save(&mut self, name: &str, title: &str, space: &str) {
@@ -701,7 +758,8 @@ impl App {
     }
 }
 
-/// The session's screen as styled text, its trailing blank lines dropped.
+/// The session's screen as styled text, ending at the cursor's line: below a prompt there is only
+/// noise, such as Claude's status lines.
 fn preview(name: &str) -> Option<Text<'static>> {
     let output = Command::new("zmx")
         .args(["history", name, "--vt", "--screen"])
@@ -710,6 +768,10 @@ fn preview(name: &str) -> Option<Text<'static>> {
         .output()
         .ok()?;
     let mut text = keep_text_and_colors(&output.stdout).into_text().ok()?;
+    // the dump's rows are the screen's, from its first; it ends by placing the cursor
+    if let Some(row) = cursor_row(&output.stdout) {
+        text.lines.truncate(row);
+    }
     while text.lines.last().is_some_and(|line| line.width() == 0) {
         text.lines.pop();
     }
@@ -717,6 +779,33 @@ fn preview(name: &str) -> Option<Text<'static>> {
         text.lines.remove(0);
     }
     Some(text)
+}
+
+/// The cursor's row, 1-based, from the last cursor placement (CSI row ; column H) in the dump.
+fn cursor_row(dump: &[u8]) -> Option<usize> {
+    let mut row = None;
+    let mut index = 0;
+    while index + 1 < dump.len() {
+        if dump[index] != 0x1b || dump[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let start = index + 2;
+        let mut end = start;
+        while end < dump.len() && (dump[end].is_ascii_digit() || dump[end] == b';') {
+            end += 1;
+        }
+        if dump.get(end) == Some(&b'H') {
+            let params = std::str::from_utf8(&dump[start..end]).unwrap_or_default();
+            row = params
+                .split(';')
+                .next()
+                .and_then(|r| r.parse().ok())
+                .or(Some(1));
+        }
+        index = end;
+    }
+    row
 }
 
 /// zmx's screen dump as plain text with colors: cursor moves forward become spaces, and every
@@ -782,7 +871,16 @@ fn keep_text_and_colors(dump: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::keep_text_and_colors;
+    use super::{cursor_row, keep_text_and_colors};
+
+    #[test]
+    fn finds_the_cursor_row_of_the_last_placement() {
+        let dump =
+            b"\x1b[?1049h  \r\nA\r\n\x1b[38;2;1;2;3mB\x1b[0m\x1b[>4;2m\x1b[2;3H\x1b[0m\x1b(B";
+        assert_eq!(cursor_row(dump), Some(2));
+        // a capital H in the text is not a placement
+        assert_eq!(cursor_row(b"\x1b[5;1H\x1b[38;2;1;2;3mHello H"), Some(5));
+    }
 
     #[test]
     fn keeps_text_and_colors_and_turns_cursor_moves_into_spaces() {
