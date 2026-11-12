@@ -32,8 +32,6 @@ const CARD_HEIGHT: u16 = 10;
 /// Blank columns after a card, and blank rows under a row of cards.
 const CARD_GAP: u16 = 2;
 const ROW_GAP: u16 = 1;
-/// The strip a card is dropped on to leave its space, while no session is without one.
-const NO_SPACE_STRIP: u16 = 3;
 const PREVIEW_INTERVAL: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(100);
 
@@ -120,6 +118,8 @@ struct App {
     reveal: bool,
     /// Where each card was drawn last, for the mouse and for moving up and down.
     cards: Vec<(String, Rect)>,
+    /// The title's rows, where it was drawn last: a dragged card let go there leaves its space.
+    top: Rect,
     /// The spaces shown folded, as skiff keeps them.
     collapsed: HashSet<String>,
     /// Where each group was drawn last, for dropping a card past the others.
@@ -179,6 +179,7 @@ pub fn ui() -> io::Result<()> {
         reveal: true,
         cards: Vec::new(),
         groups: Vec::new(),
+        top: Rect::default(),
         collapsed: store::Spaces::load().collapsed.into_iter().collect(),
         menu: Rect::default(),
         press: None,
@@ -312,11 +313,22 @@ impl App {
         );
         let status = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
         // the title lies on the sessions without a space: the first, darker shade
-        frame.buffer_mut().set_style(
-            Rect::new(area.x, area.y, area.width, grid.y - area.y),
-            Style::new().bg(SPACES[0]),
-        );
+        self.top = Rect::new(area.x, area.y, area.width, grid.y - area.y);
+        frame
+            .buffer_mut()
+            .set_style(self.top, Style::new().bg(SPACES[0]));
         draw_title(frame, title);
+        // a card dragged over it leaves its space there
+        if matches!(self.drop_target(), Some(Drop::Group(None)))
+            && self.top.contains(self.pointer.into())
+        {
+            let below = Rect::new(area.x, grid.y.saturating_sub(1), area.width, 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled("no space", Style::new().fg(READY)))
+                    .alignment(Alignment::Center),
+                below,
+            );
+        }
         self.draw_grid(frame, grid);
         self.draw_status(frame, status);
         if self.dialog.is_some() {
@@ -339,13 +351,6 @@ impl App {
             height: 0,
         };
         let mut y = 0u16;
-        // while a card is dragged and no session is without a space, a strip on top to drop it there
-        if self.dragging.is_some() && visible.iter().all(|(_, space)| space.is_some()) {
-            layout
-                .groups
-                .push((None, Rect::new(0, 0, width, NO_SPACE_STRIP)));
-            y = NO_SPACE_STRIP;
-        }
         let mut index = 0;
         while index < visible.len() {
             let space = visible[index].1.clone();
@@ -413,10 +418,6 @@ impl App {
         for (shade, (space, rect)) in layout.groups.into_iter().enumerate() {
             let shade = shade + after_title;
             let lit = matches!(&target, Some(Drop::Group(g)) if *g == space);
-            let has_cards = layout
-                .cards
-                .iter()
-                .any(|(_, card)| card.y >= rect.y && card.bottom() <= rect.bottom());
             if space.is_some()
                 && rect.y >= self.scroll
                 && rect.y + SPACE_HEADING <= self.scroll + area.height
@@ -454,16 +455,6 @@ impl App {
                             .right_aligned(),
                         )
                         .render(toggle, buffer);
-                    } else if !has_cards {
-                        Paragraph::new(Line::from(Span::styled(
-                            "no space",
-                            Style::new().fg(if lit { READY } else { DIM }),
-                        )))
-                        .alignment(Alignment::Center)
-                        .render(
-                            Rect::new(whole.x, whole.y + whole.height / 2, whole.width, 1),
-                            buffer,
-                        );
                     }
                 },
             );
@@ -1120,31 +1111,26 @@ impl App {
         self.report(result);
     }
 
-    /// Where the dragged card would land, by the pointer; over itself, nowhere.
+    /// Where the dragged card would land: beside the card under the pointer (over itself,
+    /// nowhere); else at the end of the space under it; over the title, which lies on the
+    /// sessions without a space, among those.
     fn drop_target(&self) -> Option<Drop> {
         let dragged = self.dragging.as_ref()?;
         let at = self.pointer.into();
-        let (name, rect) = self
-            .cards
-            .iter()
-            .find(|(_, rect)| rect.contains(at))?
-            .clone();
-        if &name == dragged {
-            return None;
+        if let Some((name, rect)) = self.cards.iter().find(|(_, rect)| rect.contains(at)) {
+            return (name != dragged)
+                .then(|| Drop::Card(name.clone(), self.pointer.0 >= rect.x + rect.width / 2));
         }
-        Some(Drop::Card(name, self.pointer.0 >= rect.x + rect.width / 2))
+        if let Some((space, _)) = self.groups.iter().find(|(_, rect)| rect.contains(at)) {
+            return Some(Drop::Group(space.clone()));
+        }
+        self.top.contains(at).then_some(Drop::Group(None))
     }
 
     /// Puts the dragged card where it was let go: beside a card, in that card's space, or at the
     /// end of the space under the pointer.
     fn drop_dragged(&mut self) {
-        let target = self.drop_target().or_else(|| {
-            let at = self.pointer.into();
-            self.groups
-                .iter()
-                .find(|(_, rect)| rect.contains(at))
-                .map(|(space, _)| Drop::Group(space.clone()))
-        });
+        let target = self.drop_target();
         let Some(dragged) = self.dragging.take() else {
             return;
         };
