@@ -34,7 +34,6 @@ const TICK: Duration = Duration::from_millis(100);
 const WORKING: Color = Color::Rgb(0xF9, 0xE2, 0xAF);
 const ASKING: Color = Color::Rgb(0xF3, 0x8B, 0xA8);
 const READY: Color = Color::Rgb(0x94, 0xE2, 0xD5);
-const IDLE: Color = Color::Rgb(0xA6, 0xE3, 0xA1);
 const DIM: Color = Color::Rgb(0x6C, 0x70, 0x86);
 const TEXT: Color = Color::Rgb(0xCD, 0xD6, 0xF4);
 const SUBTEXT: Color = Color::Rgb(0xA6, 0xAD, 0xC8);
@@ -298,18 +297,17 @@ impl App {
 
     fn draw_card(&self, frame: &mut Frame, area: Rect, session: &Session) {
         let selected = self.selected.as_deref() == Some(session.name.as_str());
-        let (mark, color) = match session.state.as_str() {
+        // the state on the right, marked as herdr and Termarchy do; idle has no mark
+        let mark = match session.state.as_str() {
             "working" => {
                 let frame = (self.started.elapsed().as_millis() / 100) as usize % SPINNER.len();
-                (SPINNER[frame], WORKING)
+                Some((SPINNER[frame], WORKING))
             }
-            "asking" => ("×", ASKING),
-            "ready" => ("✓", READY),
-            _ => ("○", IDLE),
+            "asking" => Some(("●", ASKING)),
+            "ready" => Some(("✓", READY)),
+            _ => None,
         };
         let title = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(mark, Style::new().fg(color)),
             Span::raw(" "),
             Span::styled(
                 session.shown_name().to_owned(),
@@ -317,10 +315,20 @@ impl App {
             ),
             Span::raw(" "),
         ]);
-        let block = Block::bordered()
+        let mut block = Block::bordered()
             .border_type(BorderType::Plain)
             .border_style(Style::new().fg(if selected { TEXT } else { DIM }))
             .title(title);
+        if let Some((mark, color)) = mark {
+            block = block.title_top(
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(mark, Style::new().fg(color)),
+                    Span::raw(" "),
+                ])
+                .right_aligned(),
+            );
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if let Some(text) = self.previews.get(&session.name) {
