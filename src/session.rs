@@ -204,6 +204,16 @@ pub fn toggle_collapsed(space: &str) -> std::io::Result<Vec<String>> {
     Ok(spaces.collapsed)
 }
 
+/// Folds [space], or opens it.
+pub fn set_collapsed(space: &str, collapsed: bool) -> std::io::Result<()> {
+    let mut spaces = crate::store::Spaces::load();
+    spaces.collapsed.retain(|s| s != space);
+    if collapsed {
+        spaces.collapsed.push(space.to_owned());
+    }
+    spaces.save()
+}
+
 /// Sets the order of the spaces, as a drag in the list leaves them.
 pub fn arrange_spaces(order: Vec<String>) -> std::io::Result<()> {
     let mut spaces = crate::store::Spaces::load();

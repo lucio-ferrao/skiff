@@ -58,7 +58,7 @@ const TITLE_COLOR: Color = Color::Rgb(0x89, 0xB4, 0xFA);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 enum Message {
-    Sessions(Vec<Session>),
+    Sessions(Vec<Session>, Vec<String>),
     Preview(String, Text<'static>),
 }
 
@@ -152,8 +152,8 @@ pub fn ui() -> io::Result<()> {
     let (messages, inbox) = mpsc::channel();
     let list = messages.clone();
     std::thread::spawn(move || {
-        let _ = watch::follow(false, |sessions| {
-            Ok(list.send(Message::Sessions(sessions.to_vec())).is_ok())
+        let _ = watch::follow(false, |sessions, collapsed| {
+            Ok(list.send(Message::Sessions(sessions.to_vec(), collapsed.to_vec())).is_ok())
         });
     });
     let (wanted, requests) = mpsc::channel::<Vec<String>>();
@@ -237,7 +237,11 @@ fn run(
     while !app.quit && app.attach.is_none() {
         while let Ok(message) = inbox.try_recv() {
             match message {
-                Message::Sessions(sessions) => app.set_sessions(sessions),
+                Message::Sessions(sessions, collapsed) => {
+                    // folded elsewhere too, such as in Termarchy
+                    app.collapsed = collapsed.into_iter().collect();
+                    app.set_sessions(sessions);
+                }
                 Message::Preview(name, text) => {
                     app.previews.insert(name, text);
                 }

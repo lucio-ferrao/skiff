@@ -19,6 +19,8 @@ usage: skiff [<session>]                 open a session (no session: the session
        skiff move <session> <space>        (space \"-\" leaves it without one)
        skiff rename <session> <title>      (title \"-\" goes back to the session's name)
        skiff kill <session>
+       skiff collapse <space>              fold a space, hiding its sessions
+       skiff expand <space>
        skiff state <idle|working|asking|ready> [--from <state,...>]
                                            for the session in $ZMX_SESSION
        skiff seen <session>
@@ -58,6 +60,8 @@ fn run(args: &[&str]) -> std::io::Result<()> {
         ["move", name, space] => session::move_to(name, space),
         ["rename", name, title] => session::rename(name, title),
         ["kill", name] => session::kill(name),
+        ["collapse", space] => session::set_collapsed(space, true),
+        ["expand", space] => session::set_collapsed(space, false),
         ["state", value] => state(value, None),
         ["state", value, "--from", from] => state(value, Some(from)),
         ["seen", name] => session::mark_seen(name),

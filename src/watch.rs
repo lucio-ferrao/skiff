@@ -23,24 +23,26 @@ const SETTLE: Duration = Duration::from_millis(30);
 #[derive(serde::Serialize)]
 struct Snapshot<'a> {
     sessions: &'a [Session],
+    /// Spaces shown folded, their sessions hidden.
+    collapsed: &'a [String],
 }
 
 pub fn watch() -> io::Result<()> {
     let stdout = io::stdout();
-    follow(stdin_is_socket(), |sessions| {
+    follow(stdin_is_socket(), |sessions, collapsed| {
         let mut out = stdout.lock();
-        serde_json::to_writer(&mut out, &Snapshot { sessions })?;
+        serde_json::to_writer(&mut out, &Snapshot { sessions, collapsed })?;
         out.write_all(b"\n")?;
         out.flush()?;
         Ok(true)
     })
 }
 
-/// Calls [on_change] with the list, and again whenever it changes, until it returns false or,
-/// with [reader_socket], the reader on stdin hangs up.
+/// Calls [on_change] with the list and the folded spaces, and again whenever they change, until it
+/// returns false or, with [reader_socket], the reader on stdin hangs up.
 pub fn follow(
     reader_socket: bool,
-    mut on_change: impl FnMut(&[Session]) -> io::Result<bool>,
+    mut on_change: impl FnMut(&[Session], &[String]) -> io::Result<bool>,
 ) -> io::Result<()> {
     let socket_dir = zmx::socket_dir();
     let runtime_dir = store::runtime_dir();
@@ -57,9 +59,9 @@ pub fn follow(
     let mut last = None;
     let mut buffer = [0u8; 4096];
     loop {
-        let current = sessions()?;
+        let current = (sessions()?, store::Spaces::load().collapsed);
         if last.as_ref() != Some(&current) {
-            if !on_change(&current)? {
+            if !on_change(&current.0, &current.1)? {
                 return Ok(());
             }
             last = Some(current);
