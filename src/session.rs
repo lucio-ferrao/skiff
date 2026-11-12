@@ -184,12 +184,24 @@ pub fn rename_space(old: &str, new: &str) -> std::io::Result<()> {
             *space = new.to_owned();
         }
     }
-    for space in &mut spaces.space_order {
+    for space in spaces.space_order.iter_mut().chain(&mut spaces.collapsed) {
         if space == old {
             *space = new.to_owned();
         }
     }
     spaces.save()
+}
+
+/// Folds [space] when it is open, and opens it when folded; returns the spaces folded now.
+pub fn toggle_collapsed(space: &str) -> std::io::Result<Vec<String>> {
+    let mut spaces = crate::store::Spaces::load();
+    if let Some(at) = spaces.collapsed.iter().position(|s| s == space) {
+        spaces.collapsed.remove(at);
+    } else {
+        spaces.collapsed.push(space.to_owned());
+    }
+    spaces.save()?;
+    Ok(spaces.collapsed)
 }
 
 /// Sets the order of the spaces, as a drag in the list leaves them.

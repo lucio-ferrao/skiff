@@ -23,6 +23,9 @@ pub struct Spaces {
     /// Spaces in the order they were arranged in; those not in it follow by name.
     #[serde(default)]
     pub space_order: Vec<String>,
+    /// Spaces shown folded, their sessions hidden.
+    #[serde(default)]
+    pub collapsed: Vec<String>,
 }
 
 pub fn config_dir() -> PathBuf {
