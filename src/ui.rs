@@ -51,6 +51,8 @@ const LIFTED_SCREEN: Color = Color::Rgb(0x2A, 0x26, 0x1C);
 const SPACES: [Color; 2] = [Color::Rgb(0x1E, 0x1E, 0x2A), Color::Rgb(0x26, 0x26, 0x35)];
 /// The rows a space starts with, its name on the middle one.
 const SPACE_HEADING: u16 = 3;
+/// The blank rows an open space ends with, after its cards.
+const SPACE_FOOTER: u16 = 1;
 /// Columns kept blank on the left.
 const MARGIN: u16 = 2;
 // the title's colour: Mocha's blue
@@ -390,6 +392,10 @@ impl App {
                 layout.cards.push((name, rect));
             }
             y = first_row + count.div_ceil(columns) * (CARD_HEIGHT + ROW_GAP);
+            // an open space ends on a blank row of its shade
+            if named && !folded {
+                y += SPACE_FOOTER;
+            }
             layout
                 .groups
                 .push((space, Rect::new(0, top, width, y - top)));
