@@ -1292,6 +1292,7 @@ impl App {
         if let Some(window) = desktop::window_of(name) {
             match desktop::focus(window) {
                 Ok(true) => {
+                    lead_later(name, Duration::from_millis(500));
                     self.report(session::mark_seen(name));
                     return;
                 }
@@ -1315,6 +1316,9 @@ impl App {
                     Err(io::Error::other("could not start ghostty"))
                 }
             });
+        if result.is_ok() {
+            lead_later(name, Duration::from_secs(5));
+        }
         self.report(result);
     }
 
@@ -1361,6 +1365,12 @@ impl App {
             self.notice = Some(err.to_string());
         }
     }
+}
+
+/// Makes the session's window lead it, in the background: a new window takes a moment to attach.
+fn lead_later(name: &str, wait: Duration) {
+    let name = name.to_owned();
+    std::thread::spawn(move || desktop::lead(&name, wait));
 }
 
 /// The session's screen as styled text, ending at the cursor's line: below a prompt there is only

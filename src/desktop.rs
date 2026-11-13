@@ -4,6 +4,7 @@
 
 use std::io;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::procs::{Process, Processes};
 
@@ -19,18 +20,56 @@ fn attached_session(process: &Process) -> Option<&str> {
     }
 }
 
-/// The Ghostty process of a window showing [session].
-pub fn window_of(session: &str) -> Option<u32> {
-    let processes = Processes::read();
+/// The zmx client of [session] inside a Ghostty window, with that window's Ghostty process. The
+/// lowest pid wins, so every call picks the same window when there are several.
+fn window_client(processes: &Processes, session: &str) -> Option<(u32, u32)> {
     processes
         .iter()
         .filter(|(_, process)| attached_session(process) == Some(session))
-        .find_map(|(pid, _)| {
+        .filter_map(|(pid, _)| {
             processes
                 .ancestors(pid)
                 .find(|(_, ancestor)| ancestor.name == "ghostty")
-                .map(|(ghostty, _)| ghostty)
+                .map(|(ghostty, _)| (pid, ghostty))
         })
+        .min_by_key(|(pid, _)| *pid)
+}
+
+/// The Ghostty process of a window showing [session].
+pub fn window_of(session: &str) -> Option<u32> {
+    window_client(&Processes::read(), session).map(|(_, ghostty)| ghostty)
+}
+
+/// Makes the zmx client in the window of [session] the session's leader, so the session takes
+/// that window's size and the program repaints for it. Waits up to [wait] for the window to start.
+/// A client that does not catch SIGUSR1 yet (still starting, or an older zmx) is left alone: the
+/// signal would end it.
+pub fn lead(session: &str, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some((client, _)) = window_client(&Processes::read(), session) {
+            if catches_usr1(client) {
+                unsafe { libc::kill(client as libc::pid_t, libc::SIGUSR1) };
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether process [pid] has a handler for SIGUSR1, from the SigCgt mask in /proc.
+fn catches_usr1(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigCgt:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1 << (libc::SIGUSR1 - 1)) != 0)
 }
 
 /// The sessions shown in the window of Ghostty process [window].
