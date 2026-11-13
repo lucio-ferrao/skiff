@@ -1,5 +1,8 @@
 //! A session as skiff shows it: the zmx session, its space and the state of the agent in it.
 
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -20,6 +23,12 @@ pub struct Session {
     /// When the state last changed, in Unix milliseconds; unknown until the agent reports one.
     pub since: Option<u64>,
     pub cwd: Option<String>,
+    /// "password" while the program in it reads a line without showing it ([input_mode]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<&'static str>,
+    /// The session's shell, whose terminal [input_mode] reads.
+    #[serde(skip)]
+    pub pid: Option<u32>,
 }
 
 pub fn sessions() -> std::io::Result<Vec<Session>> {
@@ -36,6 +45,8 @@ pub fn sessions() -> std::io::Result<Vec<Session>> {
                 .to_owned(),
             since: session.label("since").and_then(|since| since.parse().ok()),
             cwd: session.cwd.clone(),
+            input: input_mode(session.pid),
+            pid: session.pid,
             name: session.name,
         })
         .collect::<Vec<_>>();
@@ -66,6 +77,29 @@ pub fn sessions() -> std::io::Result<Vec<Session>> {
         )
     });
     Ok(sessions)
+}
+
+/// "password" while the program in the terminal of the shell [pid] reads a line without echoing
+/// it, as a password prompt does: echo off with line mode on (a shell at its prompt or a
+/// full-screen program turns both off). None otherwise, or when the terminal cannot be read.
+pub fn input_mode(pid: Option<u32>) -> Option<&'static str> {
+    let tty = std::fs::read_link(format!("/proc/{}/fd/0", pid?)).ok()?;
+    if !tty.starts_with("/dev/pts/") {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(&tty)
+        .ok()?;
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr only writes into the buffer it is given
+    if unsafe { libc::tcgetattr(file.as_raw_fd(), termios.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: tcgetattr succeeded, so it filled the buffer
+    let flags = unsafe { termios.assume_init() }.c_lflag;
+    (flags & libc::ECHO == 0 && flags & libc::ICANON != 0).then_some("password")
 }
 
 pub fn now_ms() -> u64 {

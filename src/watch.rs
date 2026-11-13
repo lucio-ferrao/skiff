@@ -12,13 +12,16 @@ use std::time::Duration;
 
 use inotify::{Inotify, WatchMask};
 
-use crate::session::{Session, sessions};
+use crate::session::{self, Session, sessions};
 use crate::store;
 use crate::zmx;
 
 /// Changes that arrive together, like a hook setting a state while a session starts, are
 /// reported once.
 const SETTLE: Duration = Duration::from_millis(30);
+
+/// How often the terminals are read for a password prompt, which nothing announces.
+const INPUT_POLL: Duration = Duration::from_millis(150);
 
 #[derive(serde::Serialize)]
 struct Snapshot<'a> {
@@ -56,26 +59,42 @@ pub fn follow(
         inotify.watches().add(dir, mask)?;
     }
 
-    let mut last = None;
+    let mut last: Option<(Vec<Session>, Vec<String>)> = None;
+    let mut current = (sessions()?, store::Spaces::load().collapsed);
     let mut buffer = [0u8; 4096];
     loop {
-        let current = (sessions()?, store::Spaces::load().collapsed);
         if last.as_ref() != Some(&current) {
             if !on_change(&current.0, &current.1)? {
                 return Ok(());
             }
-            last = Some(current);
+            last = Some(current.clone());
         }
-        if !wait_for_change(&inotify, reader_socket)? {
-            return Ok(());
+        match wait_for_change(&inotify, reader_socket, INPUT_POLL)? {
+            Wait::Gone => return Ok(()),
+            Wait::Changed => {
+                std::thread::sleep(SETTLE);
+                // drain what arrived meanwhile; one listing covers it all
+                while inotify
+                    .read_events(&mut buffer)
+                    .is_ok_and(|events| events.count() > 0)
+                {}
+                current = (sessions()?, store::Spaces::load().collapsed);
+            }
+            // nothing changed but maybe a terminal's mode: read only those
+            Wait::Timeout => {
+                for session in &mut current.0 {
+                    session.input = session::input_mode(session.pid);
+                }
+            }
         }
-        std::thread::sleep(SETTLE);
-        // drain what arrived meanwhile; one listing covers it all
-        while inotify
-            .read_events(&mut buffer)
-            .is_ok_and(|events| events.count() > 0)
-        {}
     }
+}
+
+enum Wait {
+    Changed,
+    Timeout,
+    /// The reader on the socket hung up.
+    Gone,
 }
 
 /// Whether systemd handed us a connection: then stdin is the socket, and its end is the reader's.
@@ -88,8 +107,8 @@ fn stdin_is_socket() -> bool {
     }
 }
 
-/// Waits for inotify to have events. False when the reader on the socket hung up instead.
-fn wait_for_change(inotify: &Inotify, reader_socket: bool) -> io::Result<bool> {
+/// Waits for inotify to have events, at most [timeout], or for the reader on the socket to hang up.
+fn wait_for_change(inotify: &Inotify, reader_socket: bool, timeout: Duration) -> io::Result<Wait> {
     let mut fds = [
         libc::pollfd {
             fd: inotify.as_raw_fd(),
@@ -105,19 +124,23 @@ fn wait_for_change(inotify: &Inotify, reader_socket: bool) -> io::Result<bool> {
     let count = if reader_socket { 2 } else { 1 };
     loop {
         // SAFETY: fds holds `count` valid pollfd entries
-        if unsafe { libc::poll(fds.as_mut_ptr(), count, -1) } < 0 {
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout.as_millis() as i32) };
+        if ready < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(err);
         }
+        if ready == 0 {
+            return Ok(Wait::Timeout);
+        }
         // the reader never writes, so anything on the socket means it is gone
         if reader_socket && fds[1].revents != 0 {
-            return Ok(false);
+            return Ok(Wait::Gone);
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            return Ok(true);
+            return Ok(Wait::Changed);
         }
     }
 }
