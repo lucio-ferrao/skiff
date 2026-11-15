@@ -58,6 +58,10 @@ pub fn follow(
     for dir in [&socket_dir, &runtime_dir, &config_dir] {
         inotify.watches().add(dir, mask)?;
     }
+    // Claude Code writes there when a conversation gets its claude.ai link, after it starts
+    if let Some(dir) = session::claude_sessions_dir().filter(|dir| dir.is_dir()) {
+        inotify.watches().add(dir, mask)?;
+    }
 
     let mut last: Option<(Vec<Session>, Vec<String>)> = None;
     let mut current = (sessions()?, store::Spaces::load().collapsed);

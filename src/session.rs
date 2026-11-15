@@ -26,6 +26,9 @@ pub struct Session {
     /// "password" while the program in it reads a line without showing it ([input_mode]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<&'static str>,
+    /// The link to the Claude conversation in it on claude.ai, to go on with it elsewhere ([claude_url]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_url: Option<String>,
     /// The session's shell, whose terminal [input_mode] reads.
     #[serde(skip)]
     pub pid: Option<u32>,
@@ -33,6 +36,7 @@ pub struct Session {
 
 pub fn sessions() -> std::io::Result<Vec<Session>> {
     let spaces = Spaces::load();
+    let processes = crate::procs::Processes::read();
     let mut sessions = zmx::list()?
         .into_iter()
         .map(|session| Session {
@@ -46,6 +50,7 @@ pub fn sessions() -> std::io::Result<Vec<Session>> {
             since: session.label("since").and_then(|since| since.parse().ok()),
             cwd: session.cwd.clone(),
             input: input_mode(session.pid),
+            claude_url: session.pid.and_then(|shell| claude_url(&processes, shell)),
             pid: session.pid,
             name: session.name,
         })
@@ -183,6 +188,32 @@ pub fn rename(name: &str, title: &str) -> std::io::Result<()> {
         crate::zmx::send(name, &format!("/rename {shown}\r"))?;
     }
     Ok(())
+}
+
+/// Where Claude Code keeps a file per running process (`<pid>.json`).
+pub fn claude_sessions_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".claude")))
+        .map(|dir| dir.join("sessions"))
+}
+
+/// The claude.ai link of the conversation of a `claude` process descending from [shell], when it is
+/// connected by Remote Control: Claude Code writes its id as `bridgeSessionId` in the file of the
+/// process (not documented; nothing else gives it).
+fn claude_url(processes: &crate::procs::Processes, shell: u32) -> Option<String> {
+    let dir = claude_sessions_dir()?;
+    processes
+        .iter()
+        .filter(|(_, process)| process.name == "claude")
+        .filter(|(pid, _)| processes.ancestors(*pid).any(|(ancestor, _)| ancestor == shell))
+        .find_map(|(pid, _)| {
+            let file = std::fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
+            let value: serde_json::Value = serde_json::from_str(&file).ok()?;
+            let id = value.get("bridgeSessionId")?.as_str()?;
+            id.starts_with("session_")
+                .then(|| format!("https://claude.ai/code/{id}"))
+        })
 }
 
 /// Whether a `claude` process descends from [shell].
