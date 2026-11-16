@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::desktop;
+use crate::panel;
 use crate::session::{self, Session};
 use crate::store;
 use crate::watch;
@@ -41,7 +42,8 @@ const ASKING: Color = Color::Rgb(0xF3, 0x8B, 0xA8);
 const READY: Color = Color::Rgb(0x94, 0xE2, 0xD5);
 const DIM: Color = Color::Rgb(0x6C, 0x70, 0x86);
 const TEXT: Color = Color::Rgb(0xCD, 0xD6, 0xF4);
-const SUBTEXT: Color = Color::Rgb(0xA6, 0xAD, 0xC8);
+// a space's name, a step quieter than the sessions': Mocha's overlay 2, not bold
+const SPACE_NAME: Color = Color::Rgb(0x93, 0x99, 0xB2);
 // a card's title row: Mocha's surface 0, a shade lighter when selected, the text colour when lifted
 const TITLE: Color = Color::Rgb(0x31, 0x32, 0x44);
 const SELECTED: Color = Color::Rgb(0x58, 0x5B, 0x70);
@@ -148,9 +150,12 @@ struct App {
     quit: bool,
     /// The session to enter here, leaving the list until it is detached.
     attach: Option<String>,
+    /// `skiff master`: cards are their title rows alone, without the session's screen.
+    compact: bool,
 }
 
-pub fn ui() -> io::Result<()> {
+/// The session picker; [compact], `skiff master`, for a narrow column beside `skiff panel`.
+pub fn ui(compact: bool) -> io::Result<()> {
     let (messages, inbox) = mpsc::channel();
     let list = messages.clone();
     std::thread::spawn(move || {
@@ -201,6 +206,7 @@ pub fn ui() -> io::Result<()> {
         started: Instant::now(),
         quit: false,
         attach: None,
+        compact,
     };
     loop {
         let mut terminal = ratatui::init();
@@ -250,7 +256,7 @@ fn run(
             }
         }
         terminal.draw(|frame| app.draw(frame))?;
-        if last_preview.elapsed() >= PREVIEW_INTERVAL {
+        if !app.compact && last_preview.elapsed() >= PREVIEW_INTERVAL {
             let _ = wanted.send(app.cards.iter().map(|(name, _)| name.clone()).collect());
             last_preview = Instant::now();
         }
@@ -266,6 +272,10 @@ fn run(
 }
 
 impl App {
+    fn card_height(&self) -> u16 {
+        if self.compact { 1 } else { CARD_HEIGHT }
+    }
+
     fn set_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
         self.previews
@@ -385,13 +395,13 @@ impl App {
                 let position = position as u16;
                 let rect = Rect::new(
                     MARGIN + (position % columns) * card_width,
-                    first_row + (position / columns) * (CARD_HEIGHT + ROW_GAP),
+                    first_row + (position / columns) * (self.card_height() + ROW_GAP),
                     card_width,
-                    CARD_HEIGHT,
+                    self.card_height(),
                 );
                 layout.cards.push((name, rect));
             }
-            y = first_row + count.div_ceil(columns) * (CARD_HEIGHT + ROW_GAP);
+            y = first_row + count.div_ceil(columns) * (self.card_height() + ROW_GAP);
             // an open space ends on a blank row of its shade
             if named && !folded {
                 y += SPACE_FOOTER;
@@ -458,7 +468,16 @@ impl App {
                     buffer.set_style(whole, Style::new().bg(SPACES[shade % SPACES.len()]));
                     if let Some(label) = label {
                         let row = Rect::new(whole.x, whole.y + 1, whole.width, 1);
-                        Paragraph::new(Line::from(label).centered()).render(row, buffer);
+                        // the name stays centred, the folded sessions' marks after it, unless they
+                        // would reach the toggle: then the whole label is centred
+                        let name_width = label.first().map_or(0, |name| name.width()) as u16;
+                        let start = row.x + row.width.saturating_sub(name_width) / 2;
+                        let label = Line::from(label);
+                        if start + label.width() as u16 + MARGIN + 2 <= row.right() {
+                            label.render(Rect::new(start, row.y, row.right() - start, 1), buffer);
+                        } else {
+                            Paragraph::new(label.centered()).render(row, buffer);
+                        }
                         // the mark that folds or opens it, on the right, clear of the margin
                         let folded = space.as_ref().is_some_and(|s| self.collapsed.contains(s));
                         let toggle =
@@ -528,7 +547,7 @@ impl App {
             && let Some((_, slot)) = self.cards.iter().find(|(n, _)| n == name)
         {
             let width = slot.width.min(area.width);
-            let height = CARD_HEIGHT.min(area.height);
+            let height = self.card_height().min(area.height);
             let x = self
                 .pointer
                 .0
@@ -806,7 +825,11 @@ impl App {
                     self.open_window(&name);
                 }
             }
-            KeyCode::Enter => self.attach = self.selected.clone(),
+            KeyCode::Enter => {
+                if let Some(name) = self.selected.clone() {
+                    self.enter(name);
+                }
+            }
             KeyCode::Char('n') => {
                 self.dialog = Some(Dialog::New {
                     title: String::new(),
@@ -992,7 +1015,7 @@ impl App {
                     self.drop_dragged();
                 } else if let Some((name, _)) = self.press.take() {
                     self.selected = Some(name.clone());
-                    self.attach = Some(name);
+                    self.enter(name);
                 } else if let Some(space) = self.press_group.take() {
                     // a click on a space's background starts a session in it
                     self.dialog = Some(Dialog::New {
@@ -1079,11 +1102,9 @@ impl App {
         }
     }
 
-    /// A space's name; folded, with how many sessions it holds and the marks of those not idle.
+    /// A space's name; folded, with the marks of its sessions that are not idle.
     fn space_heading(&self, name: &str, lit: bool) -> Vec<Span<'static>> {
-        let style = Style::new()
-            .fg(if lit { READY } else { SUBTEXT })
-            .add_modifier(Modifier::BOLD);
+        let style = Style::new().fg(if lit { READY } else { SPACE_NAME });
         if !self.collapsed.contains(name) {
             return vec![Span::styled(name.to_owned(), style)];
         }
@@ -1092,7 +1113,7 @@ impl App {
             .iter()
             .filter(|s| s.space.as_deref() == Some(name))
             .collect::<Vec<_>>();
-        let mut spans = vec![Span::styled(format!("{name} · {}", members.len()), style)];
+        let mut spans = vec![Span::styled(name.to_owned(), style)];
         for session in members {
             if let Some((mark, color)) = self.mark(session) {
                 spans.push(Span::raw(" "));
@@ -1103,10 +1124,19 @@ impl App {
     }
 
     /// Where a dragged space would land: above the space under the pointer, or below it when the
-    /// pointer is in its lower half; over the sessions without a space, above the first space.
+    /// pointer is in its lower half; over the sessions without a space, above the first space;
+    /// below the spaces, after the last.
     fn space_target(&self) -> Option<(String, bool)> {
         let dragged = self.dragging_space.as_ref()?;
         let (x, y) = self.pointer;
+        if self.below_groups(y) {
+            return self
+                .groups
+                .iter()
+                .rev()
+                .find_map(|(space, _)| space.clone().filter(|s| s != dragged))
+                .map(|last| (last, true));
+        }
         let under = self
             .groups
             .iter()
@@ -1148,8 +1178,8 @@ impl App {
     }
 
     /// Where the dragged card would land: beside the card under the pointer (over itself,
-    /// nowhere); else at the end of the space under it; over the title, which lies on the
-    /// sessions without a space, among those.
+    /// nowhere); else at the end of the space under it; below the spaces, at the end of the last;
+    /// over the title, which lies on the sessions without a space, among those.
     fn drop_target(&self) -> Option<Drop> {
         let dragged = self.dragging.as_ref()?;
         let at = self.pointer.into();
@@ -1160,7 +1190,20 @@ impl App {
         if let Some((space, _)) = self.groups.iter().find(|(_, rect)| rect.contains(at)) {
             return Some(Drop::Group(space.clone()));
         }
+        if self.below_groups(self.pointer.1) {
+            return self
+                .groups
+                .last()
+                .map(|(space, _)| Drop::Group(space.clone()));
+        }
         self.top.contains(at).then_some(Drop::Group(None))
+    }
+
+    /// Whether row [y] is below the spaces shown, where a drag lands at the bottom.
+    fn below_groups(&self, y: u16) -> bool {
+        self.groups
+            .last()
+            .is_some_and(|(_, rect)| y >= rect.bottom())
     }
 
     /// Puts the dragged card where it was let go: beside a card, in that card's space, or at the
@@ -1286,6 +1329,16 @@ impl App {
         }
     }
 
+    /// Shows the session in the panel beside the list, when one is running; otherwise the session
+    /// takes this terminal.
+    fn enter(&mut self, name: String) {
+        match panel::show(&name) {
+            Ok(true) => {}
+            Ok(false) => self.attach = Some(name),
+            Err(err) => self.notice = Some(err.to_string()),
+        }
+    }
+
     /// Brings the session's window to the front, or opens it in a Ghostty window of its own, which
     /// outlives this list.
     fn open_window(&mut self, name: &str) {
@@ -1343,7 +1396,7 @@ impl App {
             return;
         }
         self.selected = Some(name.clone());
-        self.attach = Some(name);
+        self.enter(name);
     }
 
     fn save(&mut self, name: &str, title: &str, space: &str) {

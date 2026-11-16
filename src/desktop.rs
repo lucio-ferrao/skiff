@@ -60,6 +60,18 @@ pub fn lead(session: &str, wait: Duration) {
     }
 }
 
+/// Makes zmx client [pid] its session's leader, as [lead] does, once it catches SIGUSR1.
+pub fn lead_client(pid: u32, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    while !catches_usr1(pid) {
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+}
+
 /// Whether process [pid] has a handler for SIGUSR1, from the SigCgt mask in /proc.
 fn catches_usr1(pid: u32) -> bool {
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {

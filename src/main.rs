@@ -2,6 +2,7 @@
 //! agent in each.
 
 mod desktop;
+mod panel;
 mod procs;
 mod session;
 mod store;
@@ -26,7 +27,9 @@ usage: skiff [<session>]                 open a session (no session: the session
        skiff seen <session>
        skiff seen-window <pid>             the sessions in the Ghostty window of that process
        skiff watch
-       skiff ui";
+       skiff ui
+       skiff panel                         show here the session chosen in skiff ui
+       skiff master                        skiff ui without the screens, beside skiff panel";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -48,7 +51,7 @@ fn usage_error() -> std::io::Error {
 
 fn run(args: &[&str]) -> std::io::Result<()> {
     match args {
-        [] | ["ui"] => ui::ui(),
+        [] | ["ui"] => ui::ui(false),
         ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
             Ok(())
@@ -67,6 +70,8 @@ fn run(args: &[&str]) -> std::io::Result<()> {
         ["seen", name] => session::mark_seen(name),
         ["seen-window", pid] => seen_window(pid),
         ["watch"] => watch::watch(),
+        ["panel"] => panel::panel(),
+        ["master"] => ui::ui(true),
         [name] if !name.starts_with('-') => open(name),
         _ => Err(usage_error()),
     }
