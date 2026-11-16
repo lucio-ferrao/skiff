@@ -142,6 +142,23 @@ pub fn history(session: &str, scrollback: &str) -> io::Result<String> {
     }
 }
 
+/// Starts a session with a shell without attaching to it: `zmx run` needs a command, so it runs
+/// `true` there (its line stays on the new screen). Not from inside a session, which zmx would use.
+pub fn start(session: &str) -> io::Result<()> {
+    let status = Command::new("zmx")
+        .args(["run", session, "-d", "true"])
+        .env_remove("ZMX_SESSION")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("zmx run {session} failed")))
+    }
+}
+
 /// Types [text] into the session, as if on its keyboard.
 pub fn send(session: &str, text: &str) -> io::Result<()> {
     let status = Command::new("zmx")

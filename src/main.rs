@@ -30,7 +30,8 @@ usage: skiff [<session>]                 open a session (no session: the session
                                            type a command into the session and wait for it
        skiff send <session> <text>         type keys into the session as they are
        skiff read <session> [--lines <n>]  the session's screen, with n rows above it
-       skiff show <session>                show the session in skiff panel and floating in Termarchy
+       skiff show <session>                show the session in skiff panel and floating in Termarchy,
+                                           starting it if it ended
                                            (run and send show it too)
        skiff seen-window <pid>             the sessions in the Ghostty window of that process
        skiff watch
@@ -98,7 +99,7 @@ fn run(args: &[&str]) -> std::io::Result<()> {
         ["state", value, "--from", from] => state(value, Some(from)),
         ["seen", name] => session::mark_seen(name),
         ["send", name, text] => run::send(name, text),
-        ["show", name] => run::show(name),
+        ["show", name] => run::show_or_start(name),
         ["read", name] => run::read(name, 0),
         ["read", name, "--lines", lines] => run::read(name, lines.parse().map_err(|_| usage_error())?),
         ["seen-window", pid] => seen_window(pid),

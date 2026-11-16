@@ -4,7 +4,7 @@
 //! `skiff run <session> <command>` types a command and waits for it to end, printing its output
 //! and ending with its exit code; the end is found by a marker printed after the command, read on
 //! the session's screen. `skiff send` types keys as they are, `skiff read` prints the screen,
-//! `skiff show` only shows the session. Typing shows the session to the user: in the panel beside (`skiff panel`), if one runs, and
+//! `skiff show` only shows the session, starting it if it ended. Typing shows the session to the user: in the panel beside (`skiff panel`), if one runs, and
 //! floating in Termarchy, which follows the `shown` label through `skiff watch`.
 
 use std::io;
@@ -78,6 +78,14 @@ pub fn send(name: &str, text: &str) -> io::Result<()> {
 pub fn read(name: &str, lines: u32) -> io::Result<()> {
     print!("{}", zmx::history(name, &lines.to_string())?);
     Ok(())
+}
+
+/// Shows the session, starting it first if it ended (an `exit` there ends it).
+pub fn show_or_start(name: &str) -> io::Result<()> {
+    if !zmx::list()?.iter().any(|session| session.name == name) {
+        zmx::start(name)?;
+    }
+    show(name)
 }
 
 /// Puts the session before the user: in the panel, and in the clients that follow `shown`.
