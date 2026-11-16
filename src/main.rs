@@ -4,6 +4,7 @@
 mod desktop;
 mod panel;
 mod procs;
+mod run;
 mod session;
 mod store;
 mod ui;
@@ -25,6 +26,12 @@ usage: skiff [<session>]                 open a session (no session: the session
        skiff state <idle|working|asking|ready> [--from <state,...>]
                                            for the session in $ZMX_SESSION
        skiff seen <session>
+       skiff run [--timeout <seconds>] <session> <command...>
+                                           type a command into the session and wait for it
+       skiff send <session> <text>         type keys into the session as they are
+       skiff read <session> [--lines <n>]  the session's screen, with n rows above it
+       skiff show <session>                show the session in skiff panel and floating in Termarchy
+                                           (run and send show it too)
        skiff seen-window <pid>             the sessions in the Ghostty window of that process
        skiff watch
        skiff ui
@@ -34,6 +41,28 @@ usage: skiff [<session>]                 open a session (no session: the session
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    // the exit code of a command run in a session is skiff's
+    if let ["run", rest @ ..] = args.as_slice() {
+        let (timeout, rest) = match rest {
+            ["--timeout", seconds, rest @ ..] => (seconds.parse().ok(), rest),
+            rest => (Some(600), rest),
+        };
+        return match (timeout, rest) {
+            (Some(timeout), [session, command @ ..]) if !command.is_empty() => {
+                match run::run(session, command, std::time::Duration::from_secs(timeout)) {
+                    Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+                    Err(err) => {
+                        eprintln!("skiff: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         // a watcher whose reader went away just ends
@@ -68,6 +97,10 @@ fn run(args: &[&str]) -> std::io::Result<()> {
         ["state", value] => state(value, None),
         ["state", value, "--from", from] => state(value, Some(from)),
         ["seen", name] => session::mark_seen(name),
+        ["send", name, text] => run::send(name, text),
+        ["show", name] => run::show(name),
+        ["read", name] => run::read(name, 0),
+        ["read", name, "--lines", lines] => run::read(name, lines.parse().map_err(|_| usage_error())?),
         ["seen-window", pid] => seen_window(pid),
         ["watch"] => watch::watch(),
         ["panel"] => panel::panel(),

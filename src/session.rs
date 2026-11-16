@@ -26,6 +26,10 @@ pub struct Session {
     /// "password" while the program in it reads a line without showing it ([input_mode]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<&'static str>,
+    /// When an agent last typed into it (`skiff run`, `skiff send`), in Unix milliseconds: the clients
+    /// show it to the user then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shown: Option<u64>,
     /// The link to the Claude conversation in it on claude.ai, to go on with it elsewhere ([claude_url]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_url: Option<String>,
@@ -48,6 +52,7 @@ pub fn sessions() -> std::io::Result<Vec<Session>> {
                 .unwrap_or("idle")
                 .to_owned(),
             since: session.label("since").and_then(|since| since.parse().ok()),
+            shown: session.label("shown").and_then(|shown| shown.parse().ok()),
             cwd: session.cwd.clone(),
             input: input_mode(session.pid),
             claude_url: session.pid.and_then(|shell| claude_url(&processes, shell)),

@@ -128,6 +128,20 @@ pub fn set(session: &str, labels: &[(&str, &str)]) -> io::Result<()> {
     }
 }
 
+/// The session's screen as plain text, with up to [scrollback] rows above it.
+pub fn history(session: &str, scrollback: &str) -> io::Result<String> {
+    let output = Command::new("zmx")
+        .args(["history", session, "--scrollback", scrollback])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(io::Error::other(format!("zmx history {session} failed")))
+    }
+}
+
 /// Types [text] into the session, as if on its keyboard.
 pub fn send(session: &str, text: &str) -> io::Result<()> {
     let status = Command::new("zmx")
