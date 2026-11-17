@@ -261,10 +261,19 @@ fn run(
             last_preview = Instant::now();
         }
         if event::poll(TICK)? {
+            let before = app.selected.clone();
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.key(key),
                 Event::Mouse(mouse) => app.mouse(mouse),
                 _ => {}
+            }
+            // beside `skiff panel`, the panel follows the selection as it moves
+            if app.compact
+                && app.selected != before
+                && let Some(name) = app.selected.clone()
+                && let Err(err) = panel::show(&name)
+            {
+                app.notice = Some(err.to_string());
             }
         }
     }
@@ -1383,6 +1392,11 @@ impl App {
             .map(|s| s.name.as_str())
             .collect::<Vec<_>>();
         let name = session::session_id(title, &taken);
+        // a session that ended may have left its title and space under this name
+        if let Err(err) = session::forget(&name) {
+            self.notice = Some(err.to_string());
+            return;
+        }
         if title != name
             && let Err(err) = session::rename(&name, title)
         {

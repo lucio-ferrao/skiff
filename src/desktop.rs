@@ -99,6 +99,33 @@ pub fn sessions_in(window: u32) -> Vec<String> {
         .collect()
 }
 
+/// Brings the window showing [session] to the front, or opens one of its own in Ghostty: never a
+/// window or pane already in use. Run in the graphical session (see [`crate::run::show`]).
+pub fn open_window(session: &str) -> io::Result<()> {
+    if let Some(window) = window_of(session)
+        && focus(window)?
+    {
+        lead(session, Duration::from_millis(500));
+        return Ok(());
+    }
+    let skiff = std::env::current_exe()?;
+    let status = std::process::Command::new("setsid")
+        .arg("-f")
+        .arg("ghostty")
+        .arg("-e")
+        .arg(&skiff)
+        .args(["open", session])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other("could not start ghostty"));
+    }
+    lead(session, Duration::from_secs(5));
+    Ok(())
+}
+
 /// Brings the window of process [pid] to the front. False where no compositor is supported, so
 /// the caller opens another window instead.
 pub fn focus(pid: u32) -> io::Result<bool> {

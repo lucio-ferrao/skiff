@@ -234,6 +234,16 @@ fn claude_runs_under(shell: u32) -> bool {
         })
 }
 
+/// Forgets what was kept about a session called [name] (title, space, place in the list): for a new
+/// one, which would otherwise take them from an earlier session of that name that ended.
+pub fn forget(name: &str) -> std::io::Result<()> {
+    let mut spaces = crate::store::Spaces::load();
+    spaces.titles.remove(name);
+    spaces.sessions.remove(name);
+    spaces.order.retain(|session| session != name);
+    spaces.save()
+}
+
 /// Puts [name] in [space] (None: no space) and sets the order of the sessions to [order], as a
 /// drag in the list leaves them.
 pub fn arrange(name: &str, space: Option<&str>, order: Vec<String>) -> std::io::Result<()> {

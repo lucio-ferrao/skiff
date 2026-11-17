@@ -4,13 +4,14 @@
 //! `skiff run <session> <command>` types a command and waits for it to end, printing its output
 //! and ending with its exit code; the end is found by a marker printed after the command, read on
 //! the session's screen. `skiff send` types keys as they are, `skiff read` prints the screen,
-//! `skiff show` only shows the session, starting it if it ended. Typing shows the session to the user: in the panel beside (`skiff panel`), if one runs, and
-//! floating in Termarchy, which follows the `shown` label through `skiff watch`.
+//! `skiff show` only shows the session, starting it if it ended. Typing shows the session to the
+//! user: in a Ghostty window of its own on the PC, and floating in Termarchy, which follows the
+//! `shown` label through `skiff watch`.
 
 use std::io;
 use std::time::{Duration, Instant};
 
-use crate::{panel, session, zmx};
+use crate::{session, zmx};
 
 /// The shells at whose prompt a command may be typed.
 const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "dash", "fish"];
@@ -88,9 +89,20 @@ pub fn show_or_start(name: &str) -> io::Result<()> {
     show(name)
 }
 
-/// Puts the session before the user: in the panel, and in the clients that follow `shown`.
+/// Puts the session before the user: on the PC in a Ghostty window of its own (never the window or
+/// panel being typed in), opened in the graphical session, whose environment this process may lack;
+/// and in the clients that follow `shown` (Termarchy).
 pub fn show(name: &str) -> io::Result<()> {
-    let _ = panel::show(name);
+    if let Ok(skiff) = std::env::current_exe() {
+        let _ = std::process::Command::new("systemd-run")
+            .args(["--user", "--quiet", "--collect"])
+            .arg(skiff)
+            .args(["window", name])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
     zmx::set(name, &[("shown", &session::now_ms().to_string())])?;
     crate::store::mark_changed();
     Ok(())

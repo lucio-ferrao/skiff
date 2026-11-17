@@ -17,6 +17,8 @@ const USAGE: &str = "\
 usage: skiff [<session>]                 open a session (no session: the session picker)
        skiff new <session> [--space <space>] [command...]
        skiff open <session>
+       skiff forget <session>              drop the title and space left by a session that ended
+       skiff window <session>              bring the session's Ghostty window to the front, or open one
        skiff list [--json]
        skiff move <session> <space>        (space \"-\" leaves it without one)
        skiff rename <session> <title>      (title \"-\" goes back to the session's name)
@@ -30,7 +32,7 @@ usage: skiff [<session>]                 open a session (no session: the session
                                            type a command into the session and wait for it
        skiff send <session> <text>         type keys into the session as they are
        skiff read <session> [--lines <n>]  the session's screen, with n rows above it
-       skiff show <session>                show the session in skiff panel and floating in Termarchy,
+       skiff show <session>                show the session in a Ghostty window and floating in Termarchy,
                                            starting it if it ended
                                            (run and send show it too)
        skiff seen-window <pid>             the sessions in the Ghostty window of that process
@@ -89,6 +91,8 @@ fn run(args: &[&str]) -> std::io::Result<()> {
         ["list"] => list(false),
         ["list", "--json"] => list(true),
         ["new", name, rest @ ..] => new(name, rest),
+        ["forget", name] => session::forget(name),
+        ["window", name] => desktop::open_window(name),
         ["open", name] => open(name),
         ["move", name, space] => session::move_to(name, space),
         ["rename", name, title] => session::rename(name, title),
@@ -135,6 +139,10 @@ fn list(json: bool) -> std::io::Result<()> {
 }
 
 fn new(name: &str, rest: &[&str]) -> std::io::Result<()> {
+    // a session that ended may have left its title and space under this name
+    if !zmx::list()?.iter().any(|session| session.name == name) {
+        session::forget(name)?;
+    }
     let (space, command) = match rest {
         ["--space", space, command @ ..] => (Some(*space), command),
         command => (None, command),
