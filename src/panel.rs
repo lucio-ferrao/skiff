@@ -1,18 +1,28 @@
 //! A pane beside the list that shows the session chosen in it: `skiff panel` runs in a pane split
 //! off by hand and listens on a socket; `skiff ui` sends it a session's name, and the panel swaps
-//! its zmx client for one attached to that session. The panel started last takes the socket.
+//! its zmx client for one attached to that session. The panel started last takes the socket. It
+//! starts on the first session of the list, goes to the first one left when its session ends, and
+//! ends with ctrl+\.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::{desktop, session, store};
+use crate::{desktop, session, store, zmx};
 
 const WAITING: &str =
     "\x1b[2J\x1b[H\x1b[38;2;108;112;134mskiff panel: choose a session in skiff ui\x1b[0m\r\n";
+
+/// Ctrl+\ while waiting: the terminal sends SIGQUIT, which would end the panel with a core dump.
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_quit(_: libc::c_int) {
+    QUIT.store(true, Ordering::SeqCst);
+}
 
 fn socket_path() -> PathBuf {
     store::runtime_dir().join("panel.sock")
@@ -60,34 +70,61 @@ pub fn panel() -> io::Result<()> {
         }
     });
 
+    // attached, zmx reads ctrl+\ itself (raw mode) and detaches; waiting, it ends the panel
+    unsafe { libc::signal(libc::SIGQUIT, on_quit as *const () as libc::sighandler_t) };
     let mut out = io::stdout();
-    out.write_all(WAITING.as_bytes())?;
-    out.flush()?;
-    let mut client: Option<Child> = None;
+    // the first session of the list right away, so the panel is never empty while there is one
+    let mut client = first_session()?.map(|name| attach(&name)).transpose()?;
+    if client.is_none() {
+        out.write_all(WAITING.as_bytes())?;
+        out.flush()?;
+    }
     loop {
         match chosen.recv_timeout(Duration::from_millis(100)) {
             Ok(name) => {
-                if let Some(mut old) = client.take() {
+                if let Some((_, mut old)) = client.take() {
                     // zmx restores the terminal on its way out
                     unsafe { libc::kill(old.id() as libc::pid_t, libc::SIGTERM) };
                     old.wait()?;
                 }
-                session::mark_seen(&name)?;
-                let child = Command::new("zmx").args(["attach", &name]).spawn()?;
-                let pid = child.id();
-                std::thread::spawn(move || desktop::lead_client(pid, Duration::from_secs(5)));
-                client = Some(child);
+                client = Some(attach(&name)?);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if QUIT.swap(false, Ordering::SeqCst) && client.is_none() {
+                    return Ok(());
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        // detached (ctrl+\) or the session ended: wait for the next one
-        if let Some(child) = &mut client
+        if let Some((name, child)) = &mut client
             && child.try_wait()?.is_some()
         {
-            client = None;
-            out.write_all(WAITING.as_bytes())?;
-            out.flush()?;
+            // the session still there: detached with ctrl+\, which ends the panel
+            if zmx::list()?.iter().any(|s| s.name == *name) {
+                return Ok(());
+            }
+            // it ended: the first one left, or wait for one
+            client = first_session()?.map(|name| attach(&name)).transpose()?;
+            if client.is_none() {
+                out.write_all(WAITING.as_bytes())?;
+                out.flush()?;
+            }
         }
     }
+}
+
+/// The first session as skiff ui lists them: those without a space first.
+fn first_session() -> io::Result<Option<String>> {
+    let mut sessions = session::sessions()?;
+    sessions.sort_by_key(|s| s.space.is_some());
+    Ok(sessions.into_iter().next().map(|s| s.name))
+}
+
+/// A zmx client attached to [name] in this terminal, the session marked as seen.
+fn attach(name: &str) -> io::Result<(String, Child)> {
+    session::mark_seen(name)?;
+    let child = Command::new("zmx").args(["attach", name]).spawn()?;
+    let pid = child.id();
+    std::thread::spawn(move || desktop::lead_client(pid, Duration::from_secs(5)));
+    Ok((name.to_owned(), child))
 }

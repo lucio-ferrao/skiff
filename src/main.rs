@@ -38,7 +38,7 @@ usage: skiff [<session>]                 open a session (no session: the session
        skiff seen-window <pid>             the sessions in the Ghostty window of that process
        skiff watch
        skiff ui
-       skiff panel                         show here the session chosen in skiff ui
+       skiff panel                         show here the session chosen in skiff ui (the first one until then)
        skiff master                        skiff ui without the screens, beside skiff panel";
 
 fn main() -> ExitCode {
